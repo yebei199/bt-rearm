@@ -77,6 +77,9 @@ public final class Rearm {
         IntentFilter f = new IntentFilter();
         f.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
         f.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
+        // 服务 UUID 发现完成的广播 —— 系统的 PhonePolicy 也在听它,收到即说明
+        // 触发已送达,连接该由系统自己发起了。
+        f.addAction(BluetoothDevice.ACTION_UUID);
         ctx.registerReceiver(ACL, f);
     }
 
@@ -114,6 +117,10 @@ public final class Rearm {
             BluetoothDevice d = intent.getParcelableExtra(
                     BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.class);
             if (d == null) return;
+            if (BluetoothDevice.ACTION_UUID.equals(intent.getAction())) {
+                nativeOnError("服务发现完成 " + d.getAddress());
+                return;
+            }
             nativeOnConnectionChange(
                     d.getAddress(),
                     BluetoothDevice.ACTION_ACL_CONNECTED.equals(intent.getAction()));
@@ -183,6 +190,16 @@ public final class Rearm {
         if (d == null) {
             nativeOnError(mac + " 不在已配对列表里");
             return;
+        }
+        // 借系统自己的策略逻辑来发起连接:PhonePolicy 监听 ACTION_UUID,一收到就
+        // 检查该设备的 HID 连接策略,若为「未知」便设成「允许」—— 而 HidHostService
+        // 把策略设成「允许」这个动作本身会直接调用 connect(device)。也就是说,只要
+        // 让系统重新发现一次服务 UUID,连接就由系统自己发起,不需要任何特权。
+        // fetchUuidsWithSdp 只要 BLUETOOTH_CONNECT,这个权限我们有。
+        try {
+            nativeOnError("请求重新发现服务=" + d.fetchUuidsWithSdp());
+        } catch (SecurityException e) {
+            nativeOnError("请求重新发现服务失败: " + e);
         }
         // autoConnect=true:BLE 里连接只能由广播触发 —— 外设睡着时 autoConnect=false
         // 的即时连接必然失败(实测每 10 秒试一次,一次都连不上)。true 是把设备挂进
