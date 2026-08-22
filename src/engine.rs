@@ -35,16 +35,22 @@ pub struct Row {
     pub state: String,
 }
 
+/// 一条日志。时间是输入而非现读 —— 引擎不碰时钟,测试才能可重复。
+struct Entry {
+    /// 最后一次发生的时刻。合并后的条目按最后一次计龄。
+    at_ms: u64,
+    /// 正文,不含次数后缀。
+    line: String,
+    /// 连续出现的次数。
+    repeat: usize,
+}
+
 #[derive(Default)]
 pub struct Engine {
     armed: HashSet<String>,
     last_try: HashMap<String, u64>,
     connected: HashSet<String>,
-    log: Vec<String>,
-    /// 末条日志的原文(不含次数后缀),用来判断下一条是不是重复。
-    last_line: String,
-    /// 末条日志连续出现的次数。
-    repeat: usize,
+    log: Vec<Entry>,
 }
 
 /// 事件日志保留的条数。只够看清最近发生了什么,不做长期留存。
@@ -56,23 +62,23 @@ impl Engine {
     }
 
     /// 用户点了某一行:布防 ↔ 撤防。
-    pub fn toggle(&mut self, mac: &str) -> Scan {
+    pub fn toggle(&mut self, mac: &str, now_ms: u64) -> Scan {
         if self.armed.remove(mac) {
             self.last_try.remove(mac);
-            self.note(format!("{mac} 撤防"));
+            self.note(now_ms, format!("{mac} 撤防"));
         } else {
             self.armed.insert(mac.to_string());
-            self.note(format!("{mac} 布防"));
+            self.note(now_ms, format!("{mac} 布防"));
         }
         self.scan_cmd()
     }
 
     /// 进程重启后,从存盘名单恢复布防。
-    pub fn restore(&mut self, macs: Vec<String>) -> Scan {
+    pub fn restore(&mut self, macs: Vec<String>, now_ms: u64) -> Scan {
         for mac in macs {
             self.armed.insert(mac);
         }
-        self.note(format!("恢复布防 {} 台", self.armed.len()));
+        self.note(now_ms, format!("恢复布防 {} 台", self.armed.len()));
         self.scan_cmd()
     }
 
@@ -89,7 +95,7 @@ impl Engine {
         if system_connected {
             // 系统自己连上了就让路 —— 这正是布防该袖手的时候。
             self.connected.insert(mac.to_string());
-            self.note(format!("{mac} 系统已连接,让路"));
+            self.note(now_ms, format!("{mac} 系统已连接,让路"));
             return Action::Skip("系统已连接");
         }
         // 上一次尝试还在窗口内:连接建立本身要几秒,别把它打断。
@@ -99,21 +105,21 @@ impl Engine {
             return Action::Skip("连接中");
         }
         self.last_try.insert(mac.to_string(), now_ms);
-        self.note(format!("{mac} 发起连接"));
+        self.note(now_ms, format!("{mac} 发起连接"));
         Action::Connect
     }
 
     /// 连接状态变了(我们连上的,或链路断了)。
-    pub fn on_connection_change(&mut self, mac: &str, connected: bool) {
+    pub fn on_connection_change(&mut self, mac: &str, connected: bool, now_ms: u64) {
         if connected {
             self.connected.insert(mac.to_string());
-            self.note(format!("{mac} 已连接"));
+            self.note(now_ms, format!("{mac} 已连接"));
         } else {
             self.connected.remove(mac);
             // 断开即清节流:下一条广播要能立刻接管,不必再等窗口 ——
             // 这正是这个工具存在的意义。
             self.last_try.remove(mac);
-            self.note(format!("{mac} 断开,等待广播"));
+            self.note(now_ms, format!("{mac} 断开,等待广播"));
         }
     }
 
@@ -149,14 +155,26 @@ impl Engine {
         }
     }
 
-    /// 决策事件日志。这台平板的 logcat 不可用,日志只能显示在界面上。
-    pub fn log(&self) -> &[String] {
-        &self.log
+    /// 决策事件日志,每条带上距今多久。这台平板的 logcat 不可用,日志只能
+    /// 显示在界面上;光有先后顺序不够 —— 断开是十秒前还是一小时前,决定了
+    /// 要不要担心。
+    pub fn log(&self, now_ms: u64) -> Vec<String> {
+        self.log
+            .iter()
+            .map(|e| {
+                let age = ago(now_ms.saturating_sub(e.at_ms));
+                if e.repeat > 1 {
+                    format!("{age}  {} ×{}", e.line, e.repeat)
+                } else {
+                    format!("{age}  {}", e.line)
+                }
+            })
+            .collect()
     }
 
     /// 安卓侧报上来的错误(扫描失败、权限被拒等)。同样进日志,理由同上。
-    pub fn note_external(&mut self, line: String) {
-        self.note(line);
+    pub fn note_external(&mut self, now_ms: u64, line: String) {
+        self.note(now_ms, line);
     }
 
     /// 按当前名单重新给出扫描指令。
@@ -179,24 +197,35 @@ impl Engine {
     ///
     /// 不合并的话,手柄不在时每 10 秒一轮的重试会在几分钟内把缓冲区刷满,
     /// 真正要看的那几行(服务是否就绪、系统有没有接管)全被挤掉。
-    fn note(&mut self, line: String) {
-        if self.repeat_of_last(&line) {
-            self.repeat += 1;
-            let last = self.log.len() - 1;
-            self.log[last] = format!("{line} ×{}", self.repeat);
+    fn note(&mut self, now_ms: u64, line: String) {
+        if let Some(last) = self.log.last_mut()
+            && last.line == line
+        {
+            last.repeat += 1;
+            // 按最后一次计龄:显示第一次的时间会让人以为事情早就停了,
+            // 而它可能还在每十秒发生一遍。
+            last.at_ms = now_ms;
             return;
         }
-        self.last_line = line.clone();
-        self.repeat = 1;
-        self.log.push(line);
+        self.log.push(Entry {
+            at_ms: now_ms,
+            line,
+            repeat: 1,
+        });
         if self.log.len() > LOG_CAP {
             self.log.remove(0);
         }
     }
+}
 
-    /// 这一行是否与末条同文。日志被截断后末条已不是它,此时不能再合并。
-    fn repeat_of_last(&self, line: &str) -> bool {
-        !self.log.is_empty() && line == self.last_line
+/// 把时间差说成人话。精确到秒没有意义,看的人只想知道是刚刚还是很久以前。
+fn ago(delta_ms: u64) -> String {
+    let seconds = delta_ms / 1000;
+    match seconds {
+        0 => "刚刚".to_string(),
+        1..=59 => format!("{seconds}秒前"),
+        60..=3599 => format!("{}分前", seconds / 60),
+        _ => format!("{}小时前", seconds / 3600),
     }
 }
 
@@ -210,7 +239,7 @@ mod tests {
     /// 布防一台设备的引擎。多数用例都从这里起步。
     fn armed_engine() -> Engine {
         let mut e = Engine::new();
-        e.toggle(PAD);
+        e.toggle(PAD, 0);
         e
     }
 
@@ -276,8 +305,8 @@ mod tests {
         // 这是这个工具存在的全部意义。断开即清节流,不必再等窗口。
         let mut e = armed_engine();
         e.on_advertisement(PAD, false, 1_000);
-        e.on_connection_change(PAD, true);
-        e.on_connection_change(PAD, false);
+        e.on_connection_change(PAD, true, 1_500);
+        e.on_connection_change(PAD, false, 1_800);
         assert_eq!(
             e.on_advertisement(PAD, false, 2_000),
             Action::Connect
@@ -288,7 +317,7 @@ mod tests {
     fn disarmed_device_is_no_longer_acted_on() {
         // 撤防之后即使还在广播也不再动手,且状态回到"未布防"。
         let mut e = armed_engine();
-        assert_eq!(e.toggle(PAD), Scan::Stop);
+        assert_eq!(e.toggle(PAD, 0), Scan::Stop);
         assert_eq!(
             e.on_advertisement(PAD, false, 1_000),
             Action::Skip("未布防")
@@ -301,9 +330,9 @@ mod tests {
     fn toggle_drives_scan_lifecycle() {
         // 布防名单非空才扫描,空了必须停 —— 扫描是唯一的耗电项。
         let mut e = Engine::new();
-        assert_eq!(e.toggle(PAD), Scan::Start(vec![PAD.into()]));
+        assert_eq!(e.toggle(PAD, 0), Scan::Start(vec![PAD.into()]));
         // 第二台加入后要带着两个地址重开扫描,否则新设备不在过滤器里。
-        let two = e.toggle(MOUSE);
+        let two = e.toggle(MOUSE, 0);
         match two {
             Scan::Start(mut macs) => {
                 macs.sort();
@@ -313,8 +342,8 @@ mod tests {
             }
             other => panic!("期望重开扫描,实际 {other:?}"),
         }
-        e.toggle(PAD);
-        assert_eq!(e.toggle(MOUSE), Scan::Stop);
+        e.toggle(PAD, 0);
+        assert_eq!(e.toggle(MOUSE, 0), Scan::Stop);
     }
 
     #[test]
@@ -322,7 +351,7 @@ mod tests {
         // 进程被杀后重启,存盘名单要能恢复成布防状态并重新开扫。
         let mut e = Engine::new();
         assert_eq!(
-            e.restore(vec![PAD.into()]),
+            e.restore(vec![PAD.into()], 0),
             Scan::Start(vec![PAD.into()])
         );
         assert!(e.row(PAD).armed);
@@ -339,7 +368,7 @@ mod tests {
         // 不重来的话界面显示"等待广播"而扫描根本没起来。
         let mut e = Engine::new();
         assert_eq!(e.scan_command(), Scan::Stop);
-        e.toggle(PAD);
+        e.toggle(PAD, 0);
         assert_eq!(e.scan_command(), Scan::Start(vec![PAD.into()]));
     }
 
@@ -348,8 +377,8 @@ mod tests {
         // 安卓侧的失败(扫描失败、权限被拒)也必须能被用户看到,
         // 否则界面显示"等待广播"而实际上扫描根本没起来。
         let mut e = Engine::new();
-        e.note_external("扫描失败,错误码 2".into());
-        assert!(e.log().iter().any(|l| l.contains("错误码 2")));
+        e.note_external(0, "扫描失败,错误码 2".into());
+        assert!(e.log(0).iter().any(|l| l.contains("错误码 2")));
     }
 
     #[test]
@@ -357,11 +386,29 @@ mod tests {
         // 日志要显示在界面上,不能无限增长。
         let mut e = Engine::new();
         for i in 0..(LOG_CAP + 20) {
-            e.note_external(format!("第 {i} 条"));
+            e.note_external(i as u64, format!("第 {i} 条"));
         }
-        assert_eq!(e.log().len(), LOG_CAP);
+        assert_eq!(e.log(0).len(), LOG_CAP);
         // 保留的是最近的,最早那条应被挤掉。
-        assert!(e.log().iter().all(|l| l != "第 0 条"));
+        assert!(e.log(0).iter().all(|l| !l.ends_with("第 0 条")));
+    }
+
+    #[test]
+    fn log_lines_carry_relative_age() {
+        // 光有先后顺序不够:断开是十秒前还是一小时前,决定了要不要担心。
+        let mut e = Engine::new();
+        e.note_external(1_000, "扫描失败".into());
+        assert_eq!(e.log(31_000), ["30秒前  扫描失败"]);
+    }
+
+    #[test]
+    fn repeated_line_is_aged_from_its_latest_occurrence() {
+        // 合并后的那条要显示最后一次发生在何时 —— 显示第一次的时间会让人
+        // 以为事情早就停了,而它可能还在每十秒发生一遍。
+        let mut e = Engine::new();
+        e.note_external(1_000, "发起连接".into());
+        e.note_external(60_000, "发起连接".into());
+        assert_eq!(e.log(61_000), ["1秒前  发起连接 ×2"]);
     }
 
     #[test]
@@ -370,10 +417,10 @@ mod tests {
         // 信息被挤出缓冲区。连续重复的只占一条,并标出次数。
         let mut e = Engine::new();
         for _ in 0..5 {
-            e.note_external("发起连接".into());
+            e.note_external(1_000, "发起连接".into());
         }
-        assert_eq!(e.log().len(), 1);
-        assert_eq!(e.log()[0], "发起连接 ×5");
+        assert_eq!(e.log(1_000).len(), 1);
+        assert_eq!(e.log(1_000)[0], "刚刚  发起连接 ×5");
     }
 
     #[test]
@@ -381,12 +428,12 @@ mod tests {
         // 合并只针对连续重复:中间夹了别的行,再出现的同一行是新事件,
         // 必须另起一条,否则看不出事情发生过两轮。
         let mut e = Engine::new();
-        e.note_external("发起连接".into());
-        e.note_external("已连接".into());
-        e.note_external("发起连接".into());
+        e.note_external(0, "发起连接".into());
+        e.note_external(0, "已连接".into());
+        e.note_external(0, "发起连接".into());
         assert_eq!(
-            e.log(),
-            ["发起连接", "已连接", "发起连接"]
+            e.log(0),
+            ["刚刚  发起连接", "刚刚  已连接", "刚刚  发起连接"]
         );
     }
 
@@ -397,7 +444,7 @@ mod tests {
         let mut e = armed_engine();
         e.on_advertisement(PAD, false, 1_000);
         e.on_advertisement(PAD, true, 20_000);
-        let log = e.log();
+        let log = e.log(20_000);
         assert!(
             log.iter().any(|l| l.contains("连接")),
             "日志里应有发起连接的记录: {log:?}"

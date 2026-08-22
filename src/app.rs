@@ -222,7 +222,7 @@ pub fn run(android_app: slint::android::AndroidApp) {
         .map(str::to_string)
         .collect();
     if !saved.is_empty() {
-        let cmd = with_engine(|e| e.restore(saved));
+        let cmd = with_engine(|e| e.restore(saved, uptime_ms()));
         apply(cmd);
     }
 
@@ -244,7 +244,7 @@ pub fn run(android_app: slint::android::AndroidApp) {
         move |mac| {
             let mac = mac.to_string();
             let (cmd, armed) = with_engine(|e| {
-                let cmd = e.toggle(&mac);
+                let cmd = e.toggle(&mac, uptime_ms());
                 (cmd, e.armed_macs())
             });
             save_armed(&armed);
@@ -302,9 +302,10 @@ fn rows() -> Vec<DeviceRow> {
 }
 
 fn events() -> Vec<slint::SharedString> {
+    let now = uptime_ms();
     with_engine(|e| {
         // 新的在上面,一眼看到最近发生了什么。
-        e.log().iter().rev().map(|l| l.as_str().into()).collect()
+        e.log(now).iter().rev().map(|l| l.as_str().into()).collect()
     })
 }
 
@@ -393,7 +394,7 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnConnectionC
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
         let mac = mac.try_to_string(env)?;
-        with_engine(|e| e.on_connection_change(&mac, connected));
+        with_engine(|e| e.on_connection_change(&mac, connected, uptime_ms()));
         Ok(())
     })
     .resolve::<jni::errors::LogErrorAndDefault>()
@@ -408,7 +409,7 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnError<'c>(
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
         let msg = message.try_to_string(env)?;
-        with_engine(|e| e.note_external(msg));
+        with_engine(|e| e.note_external(uptime_ms(), msg));
         Ok(())
     })
     .resolve::<jni::errors::LogErrorAndDefault>()
@@ -432,7 +433,7 @@ fn call_connect(mac: &str) {
     call_with_str!("connect", mac);
 }
 
-/// 单调时钟毫秒数,喂给引擎做节流。
+/// 墙上时钟毫秒数,喂给引擎做节流与日志计龄。
 fn uptime_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
