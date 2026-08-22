@@ -1,0 +1,44 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'io.github.yebei199.btrearm'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "io.github.yebei199.btrearm"
+        // connectGatt 的 TRANSPORT_LE 重载要 API 23;26 与 slint 的
+        // android-activity 后端保持一致。
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "0.1.0"
+
+        ndk {
+            // ABI 由 cargo-ndk 放进 jniLibs 的目录决定,这里只是挡住野目录。
+            //noinspection ChromeOsAbiSupport
+            abiFilters = (project.findProperty('rearmAbis') ?: 'arm64-v8a').split(',')
+        }
+    }
+
+    buildTypes {
+        debug {
+            // Rust 由 cargo-ndk 在 gradle 之前编好;debug APK 里装的是
+            // release profile 的 .so(debug 的 slint+skia 体积大得离谱)。
+            debuggable true
+        }
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    // none —— 只用安卓框架自带 API
+}

@@ -1,0 +1,5 @@
+[toolchain]
+channel = "stable"
+profile = "default"
+targets = ["aarch64-linux-android"]
+components = ["clippy", "rustfmt"]

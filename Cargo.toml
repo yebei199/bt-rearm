@@ -1,0 +1,31 @@
+[package]
+name = "btrearm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "替不布防的安卓蓝牙栈给 BLE 手柄挂后台自动回连"
+
+[lib]
+# 名字必须与 AndroidManifest.xml 里的 `android.app.lib_name` 一致。
+name = "btrearm"
+crate-type = ["cdylib"]
+
+# 全部依赖只在 android target 下存在:宿主机上 `cargo check` 是一个空 crate,
+# 秒过;真正的构建走 justfile 的 cargo-ndk 链路。
+[target.'cfg(target_os = "android")'.dependencies]
+# android 后端强制 skia 渲染器(见 i-slint-backend-selector 的 android 分支),
+# skia-bindings 对 arm64 有预编译产物,不会在本机冷编 skia。
+#
+# 跟上游 master 而不是 crates.io 的发布版:本项目要的修复已合进主分支,
+# 但还没进版本号(最新发布是 1.17.1)。
+slint = { git = "https://github.com/slint-ui/slint", branch = "master", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "backend-android-activity-06",
+    "renderer-skia",
+] }
+log = "0.4"
+android_logger = "0.15"
+# 版本必须与 slint 的 android-activity 后端用的那份一致 ——
+# `AndroidApp::vm_as_ptr()` 交出来的句柄只有同一份 jni-rs 认得。
+jni = "0.22"

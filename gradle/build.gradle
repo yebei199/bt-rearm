@@ -1,0 +1,2 @@
+// 空的根构建脚本:插件版本在 settings.gradle 的 pluginManagement 里定,
+// 模块配置在 app/build.gradle 里。AGP 要求根项目存在这个文件。

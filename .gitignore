@@ -1,0 +1,6 @@
+/target
+/gradle/app/build
+/gradle/.gradle
+/gradle/app/src/main/jniLibs
+/dist
+.direnv
