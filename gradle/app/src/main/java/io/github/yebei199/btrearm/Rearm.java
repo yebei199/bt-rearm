@@ -60,6 +60,8 @@ public final class Rearm {
     /** 当前挂着的 GATT 客户端,按 MAC 存,断开时释放。 */
     private static final Map<String, BluetoothGatt> gatts = new HashMap<>();
     private static boolean scanning;
+    /** 已报过的广播地址,每个只报一次,免得刷屏。 */
+    private static final Set<String> seen = new HashSet<>();
     private static boolean ticking;
     private static final Handler TICKER = new Handler(Looper.getMainLooper());
     private static final long TICK_MS = 10_000L;
@@ -329,8 +331,17 @@ public final class Rearm {
     private static final ScanCallback SCAN = new ScanCallback() {
         @Override
         public void onScanResult(int callbackType, ScanResult result) {
+            String mac = result.getDevice().getAddress();
+            // 系统给已配对 BLE 设备回连,靠的是把「地址 + 地址类型」放进控制器的过滤
+            // 接受名单;广播地址与配对记录里的对不上,主机就一声不吭 —— 这正是抓包
+            // 看到的样子。除按地址过滤外还挂了一路按 HID 服务 UUID 的兜底过滤,所以
+            // 手柄换了地址照样收得到。每个没见过的地址报一次,够判断是不是这回事。
+            if (seen.add(mac)) {
+                nativeOnError("广播 " + mac + " " + result.getScanRecord().getDeviceName()
+                        + " 可连接=" + result.isConnectable());
+            }
             // 判断一概不做,原样转给 Rust。
-            nativeOnAdvertisement(result.getDevice().getAddress());
+            nativeOnAdvertisement(mac);
         }
 
         @Override
