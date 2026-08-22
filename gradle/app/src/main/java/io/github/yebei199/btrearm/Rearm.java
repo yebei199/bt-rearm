@@ -188,13 +188,19 @@ public final class Rearm {
     }
 
     /**
-     * 主动把 ACL 链路拉起来。
+     * 把设备连起来。
      *
-     * <p>设备对象从已配对列表取,不用 {@code getRemoteDevice(MAC)}:那样拿到的对象
-     * 地址类型是 public,而手柄用的是随机静态地址(抓包实测),类型不符时连接请求
-     * 发给的是一个永不出现的设备。已配对列表里的对象带着配对记录里的正确类型。
+     * <p>**这个方法不能带类锁**:它里面的特权连接是一次阻塞的跨进程调用,而界面
+     * 每两秒要调 {@link #bondedDevices} 与 {@link #isConnected},那两个都带同一把
+     * 锁 —— 特权调用一卡住,界面线程就跟着卡在锁上。需要互斥的只有 GATT 客户端
+     * 那张表,单独锁它即可。
+     *
+     * <p>退回自建链路时,设备对象从已配对列表取,不用 {@code getRemoteDevice(MAC)}:
+     * 那样拿到的对象地址类型是 public,而手柄用的是随机静态地址(抓包实测),
+     * 类型不符时连接请求发给的是一个永不出现的设备。已配对列表里的对象带着
+     * 配对记录里的正确类型。
      */
-    public static synchronized void connect(String mac) {
+    public static void connect(String mac) {
         BluetoothDevice d = bonded(mac);
         if (d == null) {
             nativeOnError(mac + " 不在已配对列表里");
@@ -220,13 +226,14 @@ public final class Rearm {
         // autoConnect=true:BLE 里连接只能由广播触发 —— 外设睡着时 autoConnect=false
         // 的即时连接必然失败(实测每 10 秒试一次,一次都连不上)。true 是把设备挂进
         // 系统的后台等待名单,它一广播就自动接上,这正是"布防"要的语义。
-        // 已经挂着的不再重挂:重建客户端会把等待名单清掉。
         // 已经挂在等待名单里的不再重挂 —— 重建客户端会把名单清掉。
-        if (gatts.containsKey(mac)) return;
-        try {
-            gatts.put(mac, d.connectGatt(ctx, true, CALLBACK, BluetoothDevice.TRANSPORT_LE));
-        } catch (SecurityException e) {
-            nativeOnError("连接 " + mac + " 失败: " + e);
+        synchronized (Rearm.class) {
+            if (gatts.containsKey(mac)) return;
+            try {
+                gatts.put(mac, d.connectGatt(ctx, true, CALLBACK, BluetoothDevice.TRANSPORT_LE));
+            } catch (SecurityException e) {
+                nativeOnError("连接 " + mac + " 失败: " + e);
+            }
         }
     }
 
