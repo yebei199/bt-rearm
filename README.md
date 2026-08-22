@@ -17,15 +17,40 @@
 
 ## 原理
 
-一个 `connectGatt(autoConnect = true)` 的 GATT 客户端会把目标设备放进控制器的
-后台连接名单。设备一广播,ACL 链路即被拉起,已配对 HID 设备的输入服务随即
-附着 —— 也就是系统本该自己做的那件事。本应用只做这一件事:
+一开始走的是 `connectGatt(autoConnect = true)`:给目标设备挂一个后台连接客户端,
+设备一广播链路就被拉起。链路确实能拉起来,但**系统不会因此接管**它 —— 设置里
+照旧显示未连接,手柄照旧不能用。应用建的是自己的 GATT 链路,和系统的 HID 输入
+服务是两回事。
 
-1. 列出已配对设备,你点哪台就给哪台挂一个 autoConnect 客户端("布防");
-2. 布防名单存在 SharedPreferences 里,下次启动自动恢复;
-3. 一个前台服务把进程钉住,免得布防随进程被冻结而失效。
+让系统真正接管的动作是 `BluetoothDevice.connect()`,设置里点「连接」走的就是它。
+它要 `BLUETOOTH_PRIVILEGED` 与 `MODIFY_PHONE_STATE`,两者都是签名/特权级权限,
+普通应用申请不到也授不了。以下路径均已真机证伪:
+
+| 尝试 | 结果 |
+|---|---|
+| 反射调 `BluetoothDevice.connect()` | 方法拿得到,系统服务端拒绝:缺 `MODIFY_PHONE_STATE` |
+| HID_HOST profile 代理的 `connect(device)` | 被隐藏 API 名单拦下 |
+| 配对记录残缺(缺 HID 服务 UUID / 类型不对) | 手柄记录正常,与能回连的鼠标一致 |
+| 手柄广播地址与配对记录不符 | 地址分毫不差 |
+| HID 连接策略被设成「禁止」 | 策略就是「允许」 |
+| `fetchUuidsWithSdp()` 借系统 PhonePolicy 自行发起 | 触发送达,但那条分支只在策略「未知」时执行 |
+
+shell 用户恰好握有这两个权限。Shizuku 能把一个进程拉起在 shell 身份下,应用把
+连接请求送过去执行,系统便如常接管。所以应用做的是:
+
+1. 列出已配对设备,点一台即开始布防;
+2. 扫到它的广播、且系统没连它时,请 shell 身份的服务调用系统的连接接口;
+3. 布防名单存在 SharedPreferences 里,下次启动自动恢复;
+4. 前台服务把进程钉住,免得布防随进程被冻结而失效。
+
+Shizuku 未运行或未授权时退回自建链路,应用仍可用,只是换不来系统接管。
 
 不需要 root,不修改系统,不碰配对记录。
+
+### 前置条件
+
+装 [Shizuku](https://shizuku.rikka.app/) 并启动它(无线调试或连电脑 adb),
+首次运行时在弹窗里允许本应用使用 Shizuku。平板重启后 Shizuku 需要重新启动。
 
 ## 构建
 
@@ -37,8 +62,9 @@ just build      # cargo-ndk 编 .so + gradle 打 APK
 just run        # 装到设备并跟日志
 ```
 
-界面是 Slint,入口是 `NativeActivity` 加载的 cdylib;蓝牙那半边必须是 Java
-(`connectGatt` 的回调只能是 Java 子类),两侧靠 JNI 相连。
+界面是 Slint,入口是 `NativeActivity` 加载的 cdylib;布防决策在 Rust 的 `engine`
+模块里(有单元测试,不碰安卓 API),蓝牙那半边必须是 Java(BLE 的回调类是抽象类,
+JNI 无法从 Rust 实现),两侧靠 JNI 相连。
 
 ## 状态
 
