@@ -27,6 +27,8 @@ final class Privileged {
     private static final int PERMISSION_REQUEST_CODE = 2;
 
     private static volatile IPrivilegedConnect service;
+    /** 权限回调只注册一次:绑定器可能重连,重连时再注册会积累重复回调。 */
+    private static boolean permissionListenerAdded;
     private static Context ctx;
     private static boolean binding;
 
@@ -65,13 +67,17 @@ final class Privileged {
             bind();
             return;
         }
-        Shizuku.addRequestPermissionResultListener((code, result) -> {
-            if (code == PERMISSION_REQUEST_CODE && result == PackageManager.PERMISSION_GRANTED) {
-                bind();
-            } else {
-                Rearm.note("Shizuku 授权被拒,退回自建链路");
-            }
-        });
+        if (!permissionListenerAdded) {
+            permissionListenerAdded = true;
+            Shizuku.addRequestPermissionResultListener((code, result) -> {
+                if (code == PERMISSION_REQUEST_CODE
+                        && result == PackageManager.PERMISSION_GRANTED) {
+                    bind();
+                } else {
+                    Rearm.note("Shizuku 授权被拒,退回自建链路");
+                }
+            });
+        }
         Shizuku.requestPermission(PERMISSION_REQUEST_CODE);
     }
 
