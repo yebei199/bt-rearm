@@ -306,6 +306,31 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeResumeScan<'c
     .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
+/// 定时轮询:对每台布防中的设备主动试一次连接。
+///
+/// 不能只等广播 —— 手柄被断开后就不再广播了,而 BLE 外设开机时始终接受连接请求。
+/// 引擎里的节流窗口(RETRY_GAP_MS)保证这里不会把正在建立的连接打断。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeTick<'c>(
+    mut env: jni::EnvUnowned<'c>,
+    _class: jni::objects::JClass<'c>,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        let macs = with_engine(|e| e.armed_macs());
+        let now = uptime_ms();
+        for mac in macs {
+            let connected = call_is_connected(&mac);
+            let action =
+                with_engine(|e| e.on_advertisement(&mac, connected, now));
+            if action == Action::Connect {
+                call_connect(&mac);
+            }
+        }
+        Ok(())
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
+}
+
 /// 扫到一条广播。决策在引擎里,这里只负责把结论执行掉。
 ///
 /// `EnvUnowned` 是 jni 为原生方法准备的 FFI 安全入参,且 `with_env` 自带

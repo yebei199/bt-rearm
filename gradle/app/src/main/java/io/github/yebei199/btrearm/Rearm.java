@@ -11,8 +11,16 @@ import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanFilter;
 import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.hardware.input.InputManager;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.ParcelUuid;
+import android.view.InputDevice;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -21,6 +29,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 
 /**
  * 安卓侧的转发壳。**这里不做任何判断** —— 谁该连、什么时候连、要不要让路,
@@ -51,12 +60,63 @@ public final class Rearm {
     /** 当前挂着的 GATT 客户端,按 MAC 存,断开时释放。 */
     private static final Map<String, BluetoothGatt> gatts = new HashMap<>();
     private static boolean scanning;
+    private static boolean ticking;
+    private static final Handler TICKER = new Handler(Looper.getMainLooper());
+    private static final long TICK_MS = 10_000L;
+    private static final UUID HID_SERVICE = UUID.fromString("00001812-0000-1000-8000-00805f9b34fb");
+    private static final UUID BATTERY_SERVICE = UUID.fromString("0000180f-0000-1000-8000-00805f9b34fb");
 
     private Rearm() {}
 
     public static synchronized void attach(Context c) {
         ctx = c.getApplicationContext();
+        // 连接状态改由系统的 ACL 广播提供 —— connect() 把连接交给系统栈之后,
+        // 我们不再持有 GATT 客户端,也就没有自己的回调可听。
+        IntentFilter f = new IntentFilter();
+        f.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
+        f.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
+        ctx.registerReceiver(ACL, f);
     }
+
+    private static final BluetoothGattCallback CALLBACK = new BluetoothGattCallback() {
+        @Override
+        public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
+            String mac = g.getDevice().getAddress();
+            if (newState != BluetoothProfile.STATE_CONNECTED) {
+                synchronized (Rearm.class) {
+                    closeQuietly(gatts.remove(mac));
+                }
+                return;
+            }
+        }
+
+    };
+
+    private static void closeQuietly(BluetoothGatt g) {
+        if (g == null) return;
+        try {
+            g.close();
+        } catch (SecurityException e) {
+            // 关闭失败不影响后续,忽略。
+        }
+    }
+
+    /** 只取 128 位 UUID 里那 4 位短码,日志一行放得下。 */
+    private static String shortUuid(UUID u) {
+        return u.toString().substring(4, 8);
+    }
+
+    private static final BroadcastReceiver ACL = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context c, Intent intent) {
+            BluetoothDevice d = intent.getParcelableExtra(
+                    BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.class);
+            if (d == null) return;
+            nativeOnConnectionChange(
+                    d.getAddress(),
+                    BluetoothDevice.ACTION_ACL_CONNECTED.equals(intent.getAction()));
+        }
+    };
 
     // ---- Rust 调过来的:平台能力,不含判断 ----
 
@@ -69,7 +129,10 @@ public final class Rearm {
     public static synchronized void startScan(String macList) {
         String[] macs = macList.isEmpty() ? new String[0] : macList.split("\n");
         BluetoothLeScanner scanner = scanner();
-        if (scanner == null) return;
+        if (scanner == null) {
+            nativeOnError("拿不到扫描器,蓝牙可能已关闭");
+            return;
+        }
         try {
             if (scanning) {
                 scanner.stopScan(SCAN);
@@ -79,6 +142,11 @@ public final class Rearm {
             for (String mac : macs) {
                 filters.add(new ScanFilter.Builder().setDeviceAddress(mac).build());
             }
+            // 兜底:地址过滤偶尔漏(地址类型、机型差异都可能),HOGP 规范要求 HID 外设
+            // 的可连接广播携带 0x1812,按它再收一路。过滤器之间是"或";收进来的广播
+            // 是不是布防目标,由 Rust 引擎按名单判断。
+            filters.add(new ScanFilter.Builder()
+                    .setServiceUuid(new ParcelUuid(HID_SERVICE)).build());
             // LOW_POWER 已足够:手柄开机后会持续广播好几分钟。
             ScanSettings settings = new ScanSettings.Builder()
                     .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
@@ -114,11 +182,14 @@ public final class Rearm {
             nativeOnError(mac + " 不在已配对列表里");
             return;
         }
+        // autoConnect=true:BLE 里连接只能由广播触发 —— 外设睡着时 autoConnect=false
+        // 的即时连接必然失败(实测每 10 秒试一次,一次都连不上)。true 是把设备挂进
+        // 系统的后台等待名单,它一广播就自动接上,这正是"布防"要的语义。
+        // 已经挂着的不再重挂:重建客户端会把等待名单清掉。
+        // 已经挂在等待名单里的不再重挂 —— 重建客户端会把名单清掉。
+        if (gatts.containsKey(mac)) return;
         try {
-            closeQuietly(gatts.remove(mac));
-            // autoConnect=false:广播刚到手,目标就在旁边,这是"现在就连"。
-            // autoConnect=true 的后台名单在这台平板上实测无效。
-            gatts.put(mac, d.connectGatt(ctx, false, CALLBACK, BluetoothDevice.TRANSPORT_LE));
+            gatts.put(mac, d.connectGatt(ctx, true, CALLBACK, BluetoothDevice.TRANSPORT_LE));
         } catch (SecurityException e) {
             nativeOnError("连接 " + mac + " 失败: " + e);
         }
@@ -141,18 +212,29 @@ public final class Rearm {
         return sb.toString();
     }
 
-    /** 这台设备当前有没有链路 —— GATT 与 HID 任一在连即算已连。 */
+    /**
+     * 系统是否已经把这台设备当输入设备用上了。
+     *
+     * <p>不能查 GATT 连接状态:我们自己开的 GATT 链路也会让它变 true,而那条链路
+     * 挂着的时候系统里照样显示未连接、手柄照样不能用 —— 拿它当"让路"依据会把主动
+     * 连接全挡掉。{@code BluetoothProfile.HID_DEVICE} 更是方向相反的角色(本机当
+     * 外设)。真正等价于设置里那个"已连接"的公开信号,是它有没有出现在输入设备列表里。
+     */
     public static synchronized boolean isConnected(String mac) {
         BluetoothDevice d = bonded(mac);
         if (d == null || ctx == null) return false;
-        BluetoothManager m = (BluetoothManager) ctx.getSystemService(Context.BLUETOOTH_SERVICE);
-        if (m == null) return false;
+        InputManager im = (InputManager) ctx.getSystemService(Context.INPUT_SERVICE);
+        if (im == null) return false;
+        String name;
         try {
-            for (int profile : new int[] {BluetoothProfile.GATT, BluetoothProfile.HID_DEVICE}) {
-                if (m.getConnectedDevices(profile).contains(d)) return true;
-            }
-        } catch (SecurityException | IllegalArgumentException e) {
-            // 某些 profile 在部分机型上不给查,当作没连。
+            name = d.getName();
+        } catch (SecurityException e) {
+            return false;
+        }
+        if (name == null) return false;
+        for (int id : im.getInputDeviceIds()) {
+            InputDevice dev = im.getInputDevice(id);
+            if (dev != null && name.equals(dev.getName())) return true;
         }
         return false;
     }
@@ -174,14 +256,35 @@ public final class Rearm {
         prefs().edit().putStringSet("macs", set).apply();
     }
 
-    /** 权限到手后让 Rust 按当前布防名单重开扫描。 */
+    /** 权限到手后让 Rust 按当前布防名单重开扫描,并起定时轮询。 */
     public static void resumeScan() {
         nativeResumeScan();
+        startTicking();
+    }
+
+    /**
+     * 定时主动重试连接。
+     *
+     * <p>光等广播不够:手柄一旦被断开就不再广播,而它开机期间始终接受连接请求。
+     * 间隔取 10 秒,略大于引擎的重试窗口,免得每次 tick 都撞在节流上。
+     */
+    private static synchronized void startTicking() {
+        if (ticking) return;
+        ticking = true;
+        TICKER.post(new Runnable() {
+            @Override
+            public void run() {
+                nativeTick();
+                TICKER.postDelayed(this, TICK_MS);
+            }
+        });
     }
 
     // ---- Java 转给 Rust 的事件 ----
 
     private static native void nativeResumeScan();
+
+    private static native void nativeTick();
 
     private static native void nativeOnAdvertisement(String mac);
 
@@ -205,20 +308,6 @@ public final class Rearm {
         }
     };
 
-    private static final BluetoothGattCallback CALLBACK = new BluetoothGattCallback() {
-        @Override
-        public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
-            String mac = g.getDevice().getAddress();
-            boolean connected = newState == BluetoothProfile.STATE_CONNECTED;
-            if (!connected) {
-                synchronized (Rearm.class) {
-                    closeQuietly(gatts.remove(mac));
-                }
-            }
-            nativeOnConnectionChange(mac, connected);
-        }
-    };
-
     // ---- 内部工具 ----
 
     private static BluetoothDevice bonded(String mac) {
@@ -234,14 +323,6 @@ public final class Rearm {
         return null;
     }
 
-    private static void closeQuietly(BluetoothGatt g) {
-        if (g == null) return;
-        try {
-            g.close();
-        } catch (SecurityException e) {
-            // close 也要 BLUETOOTH_CONNECT;走到这里权限必然已批过,防御而已。
-        }
-    }
 
     private static BluetoothAdapter adapter() {
         if (ctx == null) return null;
