@@ -20,21 +20,29 @@ public class MainActivity extends NativeActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         Rearm.attach(this);
-        if (Build.VERSION.SDK_INT >= 31
-                && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
-                        != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[] {Manifest.permission.BLUETOOTH_CONNECT}, REQ_BT);
+        if (Build.VERSION.SDK_INT >= 31 && missingBtPermission()) {
+            requestPermissions(
+                    new String[] {
+                        Manifest.permission.BLUETOOTH_CONNECT,
+                        Manifest.permission.BLUETOOTH_SCAN,
+                    },
+                    REQ_BT);
         } else {
             ready();
         }
     }
 
+    private boolean missingBtPermission() {
+        return checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
+                        != PackageManager.PERMISSION_GRANTED
+                || checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN)
+                        != PackageManager.PERMISSION_GRANTED;
+    }
+
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(requestCode, permissions, results);
-        if (requestCode == REQ_BT
-                && results.length > 0
-                && results[0] == PackageManager.PERMISSION_GRANTED) {
+        if (requestCode == REQ_BT && !missingBtPermission()) {
             ready();
         }
     }

@@ -3,9 +3,16 @@
 
     <!-- API 31 起蓝牙操作(connectGatt、getBondedDevices)走这颗运行期权限。 -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- 盯广播的 BLE 扫描。neverForLocation:不做定位推断,免去位置权限。 -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
     <!-- API 30 及以下的旧权限,minSdk 26 覆盖到的老设备用。 -->
     <uses-permission
         android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADMIN"
         android:maxSdkVersion="30" />
 
     <!-- 保活服务。connectedDevice 类型对 targetSdk 34 是强制声明的。 -->
