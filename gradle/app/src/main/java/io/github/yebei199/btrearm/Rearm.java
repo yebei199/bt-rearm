@@ -18,7 +18,7 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.hardware.input.InputManager;
 import android.os.Handler;
-import android.os.Looper;
+import android.os.HandlerThread;
 import android.os.ParcelUuid;
 import android.view.InputDevice;
 
@@ -60,10 +60,20 @@ public final class Rearm {
     /** 当前挂着的 GATT 客户端,按 MAC 存,断开时释放。 */
     private static final Map<String, BluetoothGatt> gatts = new HashMap<>();
     private static boolean scanning;
-    /** 已报过的广播地址,每个只报一次,免得刷屏。 */
-    private static final Set<String> seen = new HashSet<>();
     private static boolean ticking;
-    private static final Handler TICKER = new Handler(Looper.getMainLooper());
+    /**
+     * 定时重试所在的线程。
+     *
+     * <p>不能用主线程:重试要走特权连接,那是一次阻塞的跨进程调用(超时 10 秒),
+     * 压在主线程上一旦卡住就是界面冻结加 ANR。
+     */
+    private static final Handler TICKER = newWorkerHandler();
+
+    private static Handler newWorkerHandler() {
+        HandlerThread thread = new HandlerThread("rearm-tick");
+        thread.start();
+        return new Handler(thread.getLooper());
+    }
     private static final long TICK_MS = 10_000L;
     private static final UUID HID_SERVICE = UUID.fromString("00001812-0000-1000-8000-00805f9b34fb");
 
@@ -369,17 +379,8 @@ public final class Rearm {
     private static final ScanCallback SCAN = new ScanCallback() {
         @Override
         public void onScanResult(int callbackType, ScanResult result) {
-            String mac = result.getDevice().getAddress();
-            // 系统给已配对 BLE 设备回连,靠的是把「地址 + 地址类型」放进控制器的过滤
-            // 接受名单;广播地址与配对记录里的对不上,主机就一声不吭 —— 这正是抓包
-            // 看到的样子。除按地址过滤外还挂了一路按 HID 服务 UUID 的兜底过滤,所以
-            // 手柄换了地址照样收得到。每个没见过的地址报一次,够判断是不是这回事。
-            if (seen.add(mac)) {
-                nativeOnError("广播 " + mac + " " + result.getScanRecord().getDeviceName()
-                        + " 可连接=" + result.isConnectable());
-            }
             // 判断一概不做,原样转给 Rust。
-            nativeOnAdvertisement(mac);
+            nativeOnAdvertisement(result.getDevice().getAddress());
         }
 
         @Override
