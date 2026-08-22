@@ -2,24 +2,36 @@ package io.github.yebei199.btrearm;
 
 import android.Manifest;
 import android.app.NativeActivity;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
 
 /**
- * 极薄的 NativeActivity 子类。界面全在 Rust(Slint)里;这里只负责三件事:
- * 把 Context 交给 {@link Rearm}、要 BLUETOOTH_CONNECT 权限、权限到手后
- * 恢复上次的布防并拉起保活服务。
+ * 极薄的 NativeActivity 子类。界面与布防决策都在 Rust 里,这里只负责三件事:
+ * 把 Context 交给 {@link Rearm}、要蓝牙权限、权限到手后通知 Rust 重开扫描
+ * 并拉起保活服务。
  */
 public class MainActivity extends NativeActivity {
 
     private static final int REQ_BT = 1;
 
+    /**
+     * 在 super.onCreate 之前就把 Context 交出去。
+     *
+     * <p>NativeActivity 会在 onCreate 里启动原生线程,而 Rust 那边一上来就要读存盘
+     * 的布防名单 —— 晚一步交,那次读取拿到的是 null Context,名单静默丢失。
+     */
+    @Override
+    protected void attachBaseContext(Context base) {
+        super.attachBaseContext(base);
+        Rearm.attach(base);
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        Rearm.attach(this);
         if (Build.VERSION.SDK_INT >= 31 && missingBtPermission()) {
             requestPermissions(
                     new String[] {
@@ -48,8 +60,9 @@ public class MainActivity extends NativeActivity {
     }
 
     private void ready() {
-        Rearm.armSaved();
-        // 布防挂在进程里,进程要活过切后台 —— 前台服务是那张「别冻我」的凭据。
+        // 权限到手之前发起的开扫必然失败,这里让 Rust 按当前名单重来一次。
+        Rearm.resumeScan();
+        // 布防活在进程里,进程要活过切后台 —— 前台服务是那张「别冻我」的凭据。
         startForegroundService(new Intent(this, RearmService.class));
     }
 }

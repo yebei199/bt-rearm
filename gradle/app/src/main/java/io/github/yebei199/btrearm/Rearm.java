@@ -13,8 +13,6 @@ import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
 import android.content.Context;
 import android.content.SharedPreferences;
-import android.os.SystemClock;
-import android.util.Log;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -22,201 +20,123 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
- * 布防核心:盯着广播,在系统不出手时替它把设备连回来。
+ * 安卓侧的转发壳。**这里不做任何判断** —— 谁该连、什么时候连、要不要让路,
+ * 全部由 Rust 的 engine 模块决定(那边有单元测试,这边没有)。
  *
- * <p>背景:红魔平板 5 Pro(RedMagicOS 11.5 / Android 16)不给已配对的 BLE HID
- * 设备做后台回连 —— 手柄开机后连续广播可连接报文,系统一次连接尝试都不发起。
+ * <p>之所以还需要 Java:安卓的 {@link ScanCallback} 与 {@link BluetoothGattCallback}
+ * 是抽象类,JNI 无法从 Rust 实现(动态代理只支持接口),必须有个 Java 子类把事件
+ * 转进来。除此之外这个类只提供三种能力:开关扫描、发起连接、查已配对设备。
  *
- * <p>做法是用一个按地址过滤的 BLE 扫描守着:扫到目标设备的广播、且它当前没有
- * 连接,就主动 {@code connectGatt} 把 ACL 链路拉起来,已配对 HID 的输入服务随即
- * 附着。这正是用户要的语义 —— **扫描到 + 系统没连** 才动手,系统自己连上了就
- * 什么都不做。
- *
- * <p>为什么不是 {@code connectGatt(autoConnect=true)}:那条路把设备交给控制器的
- * 后台连接名单,在这台平板上试过,布防挂上了却毫无反应(而且
- * {@code getRemoteDevice(MAC)} 拿到的设备对象地址类型是 public,与手柄实际使用的
- * 随机静态地址对不上,名单等的是一个永不出现的设备)。现在设备对象一律从已配对
- * 列表里取,地址类型由配对记录给出。
- *
- * <p>所有方法都可能被两个线程碰(Rust UI 经 JNI、扫描回调、Activity 生命周期),
- * 一律 synchronized —— 这里没有任何吞吐可言,锁粗一点换简单。
+ * <p>调用方向:
+ * <ul>
+ *   <li>Rust → Java:{@link #startScan}、{@link #stopScan}、{@link #connect}、
+ *       {@link #bondedDevices}、{@link #isConnected}
+ *   <li>Java → Rust:{@link #nativeOnAdvertisement}、{@link #nativeOnConnectionChange}
+ * </ul>
  */
 public final class Rearm {
-    private static final String TAG = "btrearm";
-
-    /** 同一台设备两次主动连接之间的最小间隔。连接建立本身要几秒,别把它打断。 */
-    private static final long RETRY_GAP_MS = 8000;
 
     private static Context ctx;
-    /** 布防名单。值是当前挂着的 GATT 客户端,没连上时为 null。 */
-    private static final Map<String, BluetoothGatt> armed = new HashMap<>();
-    /** 每台设备的人话状态,给界面看的。 */
-    private static final Map<String, String> state = new HashMap<>();
-    /** 上次发起连接的时刻,用于 RETRY_GAP_MS 节流。 */
-    private static final Map<String, Long> lastTry = new HashMap<>();
+    /** 当前挂着的 GATT 客户端,按 MAC 存,断开时释放。 */
+    private static final Map<String, BluetoothGatt> gatts = new HashMap<>();
     private static boolean scanning;
 
     private Rearm() {}
 
-    static synchronized void attach(Context c) {
+    public static synchronized void attach(Context c) {
         ctx = c.getApplicationContext();
     }
 
-    /** 把上次留下的布防名单重新挂上。要等蓝牙权限批下来才能调。 */
-    static synchronized void armSaved() {
-        for (String mac : prefs().getStringSet("macs", Collections.emptySet())) {
-            armed.put(mac, null);
-            state.put(mac, "等待广播");
+    // ---- Rust 调过来的:平台能力,不含判断 ----
+
+    /**
+     * 按地址过滤开扫。地址过滤的扫描在后台是允许的(未过滤的会被系统掐掉)。
+     *
+     * @param macList 换行分隔的 MAC 列表。用字符串而不是 String[]:JNI 造数组要
+     *     多一圈 API,而这里的量小到不值得。
+     */
+    public static synchronized void startScan(String macList) {
+        String[] macs = macList.isEmpty() ? new String[0] : macList.split("\n");
+        BluetoothLeScanner scanner = scanner();
+        if (scanner == null) return;
+        try {
+            if (scanning) {
+                scanner.stopScan(SCAN);
+                scanning = false;
+            }
+            List<ScanFilter> filters = new ArrayList<>();
+            for (String mac : macs) {
+                filters.add(new ScanFilter.Builder().setDeviceAddress(mac).build());
+            }
+            // LOW_POWER 已足够:手柄开机后会持续广播好几分钟。
+            ScanSettings settings = new ScanSettings.Builder()
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
+                    .build();
+            scanner.startScan(filters, settings, SCAN);
+            scanning = true;
+        } catch (SecurityException e) {
+            nativeOnError("开扫失败: " + e);
         }
-        syncScan();
     }
 
-    /** 行协议:{@code MAC\t名字\t是否布防\t状态},一行一台。Rust 侧照此解析。 */
-    public static synchronized String list() {
+    public static synchronized void stopScan() {
+        BluetoothLeScanner scanner = scanner();
+        if (scanner == null || !scanning) return;
+        try {
+            scanner.stopScan(SCAN);
+            scanning = false;
+        } catch (SecurityException e) {
+            nativeOnError("停扫失败: " + e);
+        }
+    }
+
+    /**
+     * 主动把 ACL 链路拉起来。
+     *
+     * <p>设备对象从已配对列表取,不用 {@code getRemoteDevice(MAC)}:那样拿到的对象
+     * 地址类型是 public,而手柄用的是随机静态地址(抓包实测),类型不符时连接请求
+     * 发给的是一个永不出现的设备。已配对列表里的对象带着配对记录里的正确类型。
+     */
+    public static synchronized void connect(String mac) {
+        BluetoothDevice d = bonded(mac);
+        if (d == null) {
+            nativeOnError(mac + " 不在已配对列表里");
+            return;
+        }
+        try {
+            closeQuietly(gatts.remove(mac));
+            // autoConnect=false:广播刚到手,目标就在旁边,这是"现在就连"。
+            // autoConnect=true 的后台名单在这台平板上实测无效。
+            gatts.put(mac, d.connectGatt(ctx, false, CALLBACK, BluetoothDevice.TRANSPORT_LE));
+        } catch (SecurityException e) {
+            nativeOnError("连接 " + mac + " 失败: " + e);
+        }
+    }
+
+    /** 行协议:{@code MAC\t名字},一行一台。设备名只有 Java 侧拿得到。 */
+    public static synchronized String bondedDevices() {
         BluetoothAdapter adapter = adapter();
         if (adapter == null) return "";
         StringBuilder sb = new StringBuilder();
         try {
             for (BluetoothDevice d : adapter.getBondedDevices()) {
-                String mac = d.getAddress();
                 String name = d.getName();
-                boolean isArmed = armed.containsKey(mac);
-                String s = isArmed
-                        ? state.getOrDefault(mac, "等待广播")
-                        : (connected(d) ? "系统已连接" : "未布防");
-                sb.append(mac).append('\t')
-                        .append(name == null ? "?" : name).append('\t')
-                        .append(isArmed ? '1' : '0').append('\t')
-                        .append(s).append('\n');
+                sb.append(d.getAddress()).append('\t')
+                        .append(name == null ? "?" : name).append('\n');
             }
         } catch (SecurityException e) {
-            // 权限没批。界面显示空列表,批完权限下一轮轮询自然恢复。
             return "";
         }
         return sb.toString();
     }
 
-    public static synchronized void toggle(String mac) {
-        if (armed.containsKey(mac)) {
-            BluetoothGatt g = armed.remove(mac);
-            closeQuietly(g);
-            state.put(mac, "未布防");
-            Log.i(TAG, "disarmed " + mac);
-        } else {
-            armed.put(mac, null);
-            state.put(mac, "等待广播");
-            Log.i(TAG, "armed " + mac);
-        }
-        prefs().edit().putStringSet("macs", new HashSet<>(armed.keySet())).apply();
-        syncScan();
-    }
-
-    /** 布防名单非空就开扫,空了就停 —— 扫描是这里唯一的耗电项。 */
-    private static void syncScan() {
-        BluetoothLeScanner scanner = scanner();
-        if (scanner == null) return;
-        try {
-            if (!armed.isEmpty() && !scanning) {
-                List<ScanFilter> filters = new ArrayList<>();
-                for (String mac : armed.keySet()) {
-                    filters.add(new ScanFilter.Builder().setDeviceAddress(mac).build());
-                }
-                // 按地址过滤的扫描在后台是允许的(未过滤的会被系统掐掉)。
-                // LOW_POWER 已足够:手柄开机后会持续广播好几分钟。
-                ScanSettings settings = new ScanSettings.Builder()
-                        .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
-                        .build();
-                scanner.startScan(filters, settings, SCAN);
-                scanning = true;
-                Log.i(TAG, "scan started for " + armed.size() + " device(s)");
-            } else if (armed.isEmpty() && scanning) {
-                scanner.stopScan(SCAN);
-                scanning = false;
-                Log.i(TAG, "scan stopped");
-            } else if (scanning) {
-                // 名单变了,重启扫描换一套过滤器。
-                scanner.stopScan(SCAN);
-                scanning = false;
-                syncScan();
-            }
-        } catch (SecurityException e) {
-            Log.w(TAG, "scan control failed: " + e);
-        }
-    }
-
-    private static final ScanCallback SCAN = new ScanCallback() {
-        @Override
-        public void onScanResult(int callbackType, ScanResult result) {
-            BluetoothDevice d = result.getDevice();
-            synchronized (Rearm.class) {
-                String mac = d.getAddress();
-                if (!armed.containsKey(mac)) return;
-
-                // 系统已经连上了 —— 什么都不做,这正是布防该让路的时候。
-                if (connected(d)) {
-                    state.put(mac, "已连接");
-                    return;
-                }
-
-                long now = SystemClock.elapsedRealtime();
-                Long last = lastTry.get(mac);
-                if (last != null && now - last < RETRY_GAP_MS) return;
-                lastTry.put(mac, now);
-
-                connect(mac);
-            }
-        }
-
-        @Override
-        public void onScanFailed(int errorCode) {
-            Log.w(TAG, "scan failed: " + errorCode);
-            synchronized (Rearm.class) {
-                scanning = false;
-            }
-        }
-    };
-
-    /** 主动把 ACL 链路拉起来。设备对象从已配对列表取 —— 地址类型必须正确。 */
-    private static void connect(String mac) {
-        BluetoothDevice d = bonded(mac);
-        if (d == null) return;
-        try {
-            closeQuietly(armed.get(mac));
-            // autoConnect=false:这是"现在就连",广播刚到手,目标就在旁边。
-            BluetoothGatt g = d.connectGatt(ctx, false, CALLBACK, BluetoothDevice.TRANSPORT_LE);
-            armed.put(mac, g);
-            state.put(mac, "正在连接");
-            Log.i(TAG, "connecting " + mac);
-        } catch (SecurityException e) {
-            Log.w(TAG, "connect " + mac + " failed: " + e);
-        }
-    }
-
-    /**
-     * 从已配对列表里取设备对象。
-     *
-     * <p>不用 {@code getRemoteDevice(MAC)}:那样拿到的对象地址类型是 public,而这只
-     * 手柄用的是随机静态地址(抓包实测),类型不符时连接请求发给的是一个永不出现
-     * 的设备。已配对列表里的对象带着配对记录里的正确类型。
-     */
-    private static BluetoothDevice bonded(String mac) {
-        BluetoothAdapter adapter = adapter();
-        if (adapter == null) return null;
-        try {
-            for (BluetoothDevice d : adapter.getBondedDevices()) {
-                if (d.getAddress().equals(mac)) return d;
-            }
-        } catch (SecurityException e) {
-            Log.w(TAG, "bonded lookup failed: " + e);
-        }
-        return null;
-    }
-
     /** 这台设备当前有没有链路 —— GATT 与 HID 任一在连即算已连。 */
-    private static boolean connected(BluetoothDevice d) {
-        if (ctx == null) return false;
+    public static synchronized boolean isConnected(String mac) {
+        BluetoothDevice d = bonded(mac);
+        if (d == null || ctx == null) return false;
         BluetoothManager m = (BluetoothManager) ctx.getSystemService(Context.BLUETOOTH_SERVICE);
         if (m == null) return false;
         try {
@@ -227,6 +147,83 @@ public final class Rearm {
             // 某些 profile 在部分机型上不给查,当作没连。
         }
         return false;
+    }
+
+    // ---- 存盘。名单内容由 Rust 决定,这里只负责读写 ----
+
+    public static synchronized String loadArmed() {
+        if (ctx == null) return "";
+        return String.join("\n", prefs().getStringSet("macs", Collections.emptySet()));
+    }
+
+    /** @param macList 换行分隔的 MAC 列表,理由同 startScan。 */
+    public static synchronized void saveArmed(String macList) {
+        if (ctx == null) return;
+        Set<String> set = new HashSet<>();
+        if (!macList.isEmpty()) {
+            Collections.addAll(set, macList.split("\n"));
+        }
+        prefs().edit().putStringSet("macs", set).apply();
+    }
+
+    /** 权限到手后让 Rust 按当前布防名单重开扫描。 */
+    public static void resumeScan() {
+        nativeResumeScan();
+    }
+
+    // ---- Java 转给 Rust 的事件 ----
+
+    private static native void nativeResumeScan();
+
+    private static native void nativeOnAdvertisement(String mac);
+
+    private static native void nativeOnConnectionChange(String mac, boolean connected);
+
+    private static native void nativeOnError(String message);
+
+    private static final ScanCallback SCAN = new ScanCallback() {
+        @Override
+        public void onScanResult(int callbackType, ScanResult result) {
+            // 判断一概不做,原样转给 Rust。
+            nativeOnAdvertisement(result.getDevice().getAddress());
+        }
+
+        @Override
+        public void onScanFailed(int errorCode) {
+            synchronized (Rearm.class) {
+                scanning = false;
+            }
+            nativeOnError("扫描失败,错误码 " + errorCode);
+        }
+    };
+
+    private static final BluetoothGattCallback CALLBACK = new BluetoothGattCallback() {
+        @Override
+        public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
+            String mac = g.getDevice().getAddress();
+            boolean connected = newState == BluetoothProfile.STATE_CONNECTED;
+            if (!connected) {
+                synchronized (Rearm.class) {
+                    closeQuietly(gatts.remove(mac));
+                }
+            }
+            nativeOnConnectionChange(mac, connected);
+        }
+    };
+
+    // ---- 内部工具 ----
+
+    private static BluetoothDevice bonded(String mac) {
+        BluetoothAdapter adapter = adapter();
+        if (adapter == null) return null;
+        try {
+            for (BluetoothDevice d : adapter.getBondedDevices()) {
+                if (d.getAddress().equals(mac)) return d;
+            }
+        } catch (SecurityException e) {
+            // 权限没批,调用方会看到"不在已配对列表里"。
+        }
+        return null;
     }
 
     private static void closeQuietly(BluetoothGatt g) {
@@ -252,24 +249,4 @@ public final class Rearm {
     private static SharedPreferences prefs() {
         return ctx.getSharedPreferences("rearm", Context.MODE_PRIVATE);
     }
-
-    private static final BluetoothGattCallback CALLBACK = new BluetoothGattCallback() {
-        @Override
-        public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
-            String mac = g.getDevice().getAddress();
-            synchronized (Rearm.class) {
-                if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    state.put(mac, "已连接");
-                } else {
-                    state.put(mac, "等待广播");
-                    // 断开后释放客户端,下一次广播再重新连 —— 留着不放会占资源,
-                    // 而且这台平板的栈对复用客户端的行为并不可靠。
-                    if (armed.containsKey(mac)) {
-                        closeQuietly(armed.put(mac, null));
-                    }
-                }
-            }
-            Log.i(TAG, mac + " newState=" + newState + " status=" + status);
-        }
-    };
 }

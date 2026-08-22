@@ -1,7 +1,7 @@
 [package]
 name = "btrearm"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 description = "替不布防的安卓蓝牙栈给 BLE 手柄挂后台自动回连"
 
