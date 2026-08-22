@@ -78,13 +78,20 @@ final class Privileged {
     private static synchronized void bind() {
         if (binding || service != null) return;
         binding = true;
-        Shizuku.bindUserService(
-                new Shizuku.UserServiceArgs(
-                                new ComponentName(ctx, PrivilegedConnect.class.getName()))
-                        .processNameSuffix("privileged")
-                        .version(SERVICE_VERSION)
-                        .daemon(false),
-                CONNECTION);
+        try {
+            Shizuku.bindUserService(
+                    new Shizuku.UserServiceArgs(
+                                    new ComponentName(ctx, PrivilegedConnect.class.getName()))
+                            .processNameSuffix("privileged")
+                            .version(SERVICE_VERSION)
+                            .daemon(false),
+                    CONNECTION);
+        } catch (Throwable t) {
+            // 不复位的话这个标志会一直挡着,后面再也不会重试,而界面只会显示
+            // 「正在绑定服务」—— 看上去像卡住,实际是永远不会再动了。
+            binding = false;
+            Rearm.note("绑定特权服务失败: " + t);
+        }
     }
 
     /**

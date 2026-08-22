@@ -9,6 +9,16 @@ use std::collections::{HashMap, HashSet};
 /// 同一台设备两次主动连接之间的最小间隔。连接建立本身要几秒,别把它打断。
 pub const RETRY_GAP_MS: u64 = 8_000;
 
+/// 盲试(没收到广播、纯靠定时器驱动)的起始间隔。
+pub const BLIND_GAP_MS: u64 = 10_000;
+
+/// 盲试间隔的上限。
+///
+/// 手柄关机时盲试注定失败,固定间隔一夜就是近三千次无效尝试,每次都让控制器
+/// 去找一个不存在的设备。间隔逐次翻倍,但不能无限拉长 —— 手柄一直开着却收不到
+/// 广播时(后台扫描被系统压制),盲试是唯一的活路,放弃它等于放弃布防。
+pub const BLIND_GAP_MAX_MS: u64 = 300_000;
+
 /// 收到一条广播后,决定要不要动手。
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
@@ -50,6 +60,8 @@ pub struct Engine {
     armed: HashSet<String>,
     last_try: HashMap<String, u64>,
     connected: HashSet<String>,
+    /// 每台设备当前的盲试间隔。收到广播或连上即回到起始值。
+    blind_gap: HashMap<String, u64>,
     log: Vec<Entry>,
 }
 
@@ -98,6 +110,9 @@ impl Engine {
             self.note(now_ms, format!("{mac} 系统已连接,让路"));
             return Action::Skip("系统已连接");
         }
+        // 收到广播意味着设备真的在:退避是为了应付设备不在,不能让它拖慢
+        // 设备回来那一刻的反应。
+        self.blind_gap.remove(mac);
         // 上一次尝试还在窗口内:连接建立本身要几秒,别把它打断。
         if let Some(last) = self.last_try.get(mac)
             && now_ms.saturating_sub(*last) < RETRY_GAP_MS
@@ -109,16 +124,47 @@ impl Engine {
         Action::Connect
     }
 
+    /// 定时器驱动的盲试:没有广播作依据,纯粹碰运气试一次。
+    ///
+    /// 存在的理由是后台扫描可能被系统压制,那时广播一条都收不到,盲试是唯一
+    /// 还能动的路径。代价是设备不在时它必然失败,所以间隔逐次翻倍 —— 一直
+    /// 十秒一次的话,手柄关一夜就是近三千次无效尝试。
+    pub fn on_tick(&mut self, mac: &str, system_connected: bool, now_ms: u64) -> Action {
+        if !self.armed.contains(mac) {
+            return Action::Skip("未布防");
+        }
+        if system_connected {
+            self.connected.insert(mac.to_string());
+            self.blind_gap.remove(mac);
+            self.note(now_ms, format!("{mac} 系统已连接,让路"));
+            return Action::Skip("系统已连接");
+        }
+        let gap = self.blind_gap.get(mac).copied().unwrap_or(BLIND_GAP_MS);
+        if let Some(last) = self.last_try.get(mac)
+            && now_ms.saturating_sub(*last) < gap
+        {
+            return Action::Skip("退避中");
+        }
+        self.last_try.insert(mac.to_string(), now_ms);
+        self.blind_gap
+            .insert(mac.to_string(), (gap * 2).min(BLIND_GAP_MAX_MS));
+        self.note(now_ms, format!("{mac} 盲试连接"));
+        Action::Connect
+    }
+
     /// 连接状态变了(我们连上的,或链路断了)。
     pub fn on_connection_change(&mut self, mac: &str, connected: bool, now_ms: u64) {
         if connected {
             self.connected.insert(mac.to_string());
+            self.blind_gap.remove(mac);
             self.note(now_ms, format!("{mac} 已连接"));
         } else {
             self.connected.remove(mac);
             // 断开即清节流:下一条广播要能立刻接管,不必再等窗口 ——
             // 这正是这个工具存在的意义。
             self.last_try.remove(mac);
+            // 刚断开时设备多半还在(掉线而非关机),值得积极重试一次。
+            self.blind_gap.remove(mac);
             self.note(now_ms, format!("{mac} 断开,等待广播"));
         }
     }
@@ -391,6 +437,61 @@ mod tests {
         assert_eq!(e.log(0).len(), LOG_CAP);
         // 保留的是最近的,最早那条应被挤掉。
         assert!(e.log(0).iter().all(|l| !l.ends_with("第 0 条")));
+    }
+
+    #[test]
+    fn blind_retry_backs_off_while_device_stays_absent() {
+        // 手柄关机时盲试注定失败。固定十秒一次的话,一夜就是近三千次无效尝试,
+        // 每次都让控制器去找一个不存在的设备。间隔要逐次拉长。
+        let mut e = armed_engine();
+        assert_eq!(e.on_tick(PAD, false, 0), Action::Connect);
+        // 第一次之后间隔翻倍,原间隔到点时还不该动。
+        assert_eq!(
+            e.on_tick(PAD, false, BLIND_GAP_MS),
+            Action::Skip("退避中")
+        );
+        assert_eq!(
+            e.on_tick(PAD, false, BLIND_GAP_MS * 2),
+            Action::Connect
+        );
+    }
+
+    #[test]
+    fn blind_retry_backoff_has_a_ceiling() {
+        // 退避不能无限拉长,否则手柄一直开着却收不到广播时,应用等于放弃了。
+        let mut e = armed_engine();
+        let mut at = 0;
+        for _ in 0..20 {
+            e.on_tick(PAD, false, at);
+            at += BLIND_GAP_MAX_MS;
+        }
+        // 到了上限之后,每隔上限时间必定还会再试一次。
+        assert_eq!(e.on_tick(PAD, false, at), Action::Connect);
+    }
+
+    #[test]
+    fn advertisement_resets_blind_retry_backoff() {
+        // 收到广播意味着设备真的在,此时必须立刻恢复灵敏 —— 退避是为了应付
+        // 设备不在,不能让它拖慢设备回来那一刻的反应。
+        let mut e = armed_engine();
+        e.on_tick(PAD, false, 0);
+        e.on_tick(PAD, false, BLIND_GAP_MS * 2);
+        // 广播到达,自身触发一次连接并把退避清零。
+        assert_eq!(
+            e.on_advertisement(PAD, false, BLIND_GAP_MS * 10),
+            Action::Connect
+        );
+        assert_eq!(
+            e.on_tick(PAD, false, BLIND_GAP_MS * 10 + BLIND_GAP_MS),
+            Action::Connect
+        );
+    }
+
+    #[test]
+    fn blind_retry_stands_down_while_system_connected() {
+        // 系统已经连上就别插手,语义与广播路径一致。
+        let mut e = armed_engine();
+        assert_eq!(e.on_tick(PAD, true, 0), Action::Skip("系统已连接"));
     }
 
     #[test]

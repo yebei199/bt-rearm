@@ -222,7 +222,7 @@ pub fn run(android_app: slint::android::AndroidApp) {
         .map(str::to_string)
         .collect();
     if !saved.is_empty() {
-        let cmd = with_engine(|e| e.restore(saved, uptime_ms()));
+        let cmd = with_engine(|e| e.restore(saved, now_ms()));
         apply(cmd);
     }
 
@@ -244,7 +244,7 @@ pub fn run(android_app: slint::android::AndroidApp) {
         move |mac| {
             let mac = mac.to_string();
             let (cmd, armed) = with_engine(|e| {
-                let cmd = e.toggle(&mac, uptime_ms());
+                let cmd = e.toggle(&mac, now_ms());
                 (cmd, e.armed_macs())
             });
             save_armed(&armed);
@@ -302,7 +302,7 @@ fn rows() -> Vec<DeviceRow> {
 }
 
 fn events() -> Vec<slint::SharedString> {
-    let now = uptime_ms();
+    let now = now_ms();
     with_engine(|e| {
         // 新的在上面,一眼看到最近发生了什么。
         e.log(now).iter().rev().map(|l| l.as_str().into()).collect()
@@ -334,10 +334,11 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeResumeScan<'c
     .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
-/// 定时轮询:对每台布防中的设备主动试一次连接。
+/// 定时盲试:对每台布防中的设备碰运气试一次连接。
 ///
-/// 不能只等广播 —— 手柄被断开后就不再广播了,而 BLE 外设开机时始终接受连接请求。
-/// 引擎里的节流窗口(RETRY_GAP_MS)保证这里不会把正在建立的连接打断。
+/// 不能只等广播 —— 后台扫描可能被系统压制,那时一条广播都收不到,盲试是唯一
+/// 还能动的路径。设备不在时它必然失败,所以引擎会把间隔逐次翻倍,并在收到广播
+/// 或连上时清零。
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeTick<'c>(
     mut env: jni::EnvUnowned<'c>,
@@ -345,11 +346,10 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeTick<'c>(
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
         let macs = with_engine(|e| e.armed_macs());
-        let now = uptime_ms();
+        let now = now_ms();
         for mac in macs {
             let connected = call_is_connected(&mac);
-            let action =
-                with_engine(|e| e.on_advertisement(&mac, connected, now));
+            let action = with_engine(|e| e.on_tick(&mac, connected, now));
             if action == Action::Connect {
                 call_connect(&mac);
             }
@@ -373,7 +373,7 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnAdvertiseme
         let mac = mac.try_to_string(env)?;
         // 连接状态要现问 Java —— 引擎自己不碰安卓 API。
         let connected = call_is_connected(&mac);
-        let now = uptime_ms();
+        let now = now_ms();
         let action =
             with_engine(|e| e.on_advertisement(&mac, connected, now));
         if action == Action::Connect {
@@ -394,7 +394,7 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnConnectionC
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
         let mac = mac.try_to_string(env)?;
-        with_engine(|e| e.on_connection_change(&mac, connected, uptime_ms()));
+        with_engine(|e| e.on_connection_change(&mac, connected, now_ms()));
         Ok(())
     })
     .resolve::<jni::errors::LogErrorAndDefault>()
@@ -409,7 +409,7 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnError<'c>(
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
         let msg = message.try_to_string(env)?;
-        with_engine(|e| e.note_external(uptime_ms(), msg));
+        with_engine(|e| e.note_external(now_ms(), msg));
         Ok(())
     })
     .resolve::<jni::errors::LogErrorAndDefault>()
@@ -434,7 +434,7 @@ fn call_connect(mac: &str) {
 }
 
 /// 墙上时钟毫秒数,喂给引擎做节流与日志计龄。
-fn uptime_ms() -> u64 {
+fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
