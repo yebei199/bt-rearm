@@ -66,7 +66,6 @@ public final class Rearm {
     private static final Handler TICKER = new Handler(Looper.getMainLooper());
     private static final long TICK_MS = 10_000L;
     private static final UUID HID_SERVICE = UUID.fromString("00001812-0000-1000-8000-00805f9b34fb");
-    private static final UUID BATTERY_SERVICE = UUID.fromString("0000180f-0000-1000-8000-00805f9b34fb");
 
     private Rearm() {}
 
@@ -338,6 +337,16 @@ public final class Rearm {
                 TICKER.postDelayed(this, TICK_MS);
             }
         });
+    }
+
+    /** 特权连接状态,给界面常驻显示。Rust 只认这个类,故在此转一道。 */
+    public static String privilegedStatus() {
+        return Privileged.status();
+    }
+
+    /** 特权连接是否可用,界面据此上色。 */
+    public static boolean privilegedReady() {
+        return Privileged.ready();
     }
 
     /** 供同包内其它类往界面日志写一行。 */

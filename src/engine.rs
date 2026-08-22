@@ -41,6 +41,10 @@ pub struct Engine {
     last_try: HashMap<String, u64>,
     connected: HashSet<String>,
     log: Vec<String>,
+    /// 末条日志的原文(不含次数后缀),用来判断下一条是不是重复。
+    last_line: String,
+    /// 末条日志连续出现的次数。
+    repeat: usize,
 }
 
 /// 事件日志保留的条数。只够看清最近发生了什么,不做长期留存。
@@ -171,11 +175,28 @@ impl Engine {
         }
     }
 
+    /// 记一条日志。连续重复的合并成一条并计次。
+    ///
+    /// 不合并的话,手柄不在时每 10 秒一轮的重试会在几分钟内把缓冲区刷满,
+    /// 真正要看的那几行(服务是否就绪、系统有没有接管)全被挤掉。
     fn note(&mut self, line: String) {
+        if self.repeat_of_last(&line) {
+            self.repeat += 1;
+            let last = self.log.len() - 1;
+            self.log[last] = format!("{line} ×{}", self.repeat);
+            return;
+        }
+        self.last_line = line.clone();
+        self.repeat = 1;
         self.log.push(line);
         if self.log.len() > LOG_CAP {
             self.log.remove(0);
         }
+    }
+
+    /// 这一行是否与末条同文。日志被截断后末条已不是它,此时不能再合并。
+    fn repeat_of_last(&self, line: &str) -> bool {
+        !self.log.is_empty() && line == self.last_line
     }
 }
 
@@ -341,6 +362,32 @@ mod tests {
         assert_eq!(e.log().len(), LOG_CAP);
         // 保留的是最近的,最早那条应被挤掉。
         assert!(e.log().iter().all(|l| l != "第 0 条"));
+    }
+
+    #[test]
+    fn consecutive_duplicate_lines_collapse_into_one_entry() {
+        // 手柄不在时每 10 秒重试一次,同一行会把日志刷满,真正有用的
+        // 信息被挤出缓冲区。连续重复的只占一条,并标出次数。
+        let mut e = Engine::new();
+        for _ in 0..5 {
+            e.note_external("发起连接".into());
+        }
+        assert_eq!(e.log().len(), 1);
+        assert_eq!(e.log()[0], "发起连接 ×5");
+    }
+
+    #[test]
+    fn a_different_line_ends_the_collapse() {
+        // 合并只针对连续重复:中间夹了别的行,再出现的同一行是新事件,
+        // 必须另起一条,否则看不出事情发生过两轮。
+        let mut e = Engine::new();
+        e.note_external("发起连接".into());
+        e.note_external("已连接".into());
+        e.note_external("发起连接".into());
+        assert_eq!(
+            e.log(),
+            ["发起连接", "已连接", "发起连接"]
+        );
     }
 
     #[test]

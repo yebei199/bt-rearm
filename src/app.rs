@@ -24,6 +24,8 @@ slint::slint! {
         background: #101418;
         in property <[DeviceRow]> devices;
         in property <[string]> events;
+        in property <string> privileged;
+        in property <bool> privileged-ready;
         callback toggle(string);
 
         VerticalLayout {
@@ -39,6 +41,13 @@ slint::slint! {
                 font-size: 13px;
                 color: #8899aa;
                 wrap: word-wrap;
+            }
+            // 常驻:让系统接管全靠这条特权通道,它断了应用就只是个摆设。
+            // 不摆在明处,平板重启后 Shizuku 没起来,用户只会觉得「又不灵了」。
+            Text {
+                text: root.privileged;
+                font-size: 13px;
+                color: root.privileged-ready ? #4ade80 : #f59e0b;
             }
             for d in root.devices: Rectangle {
                 height: 70px;
@@ -154,6 +163,22 @@ macro_rules! call_string {
     }};
 }
 
+/// 无参、返回布尔值的静态方法。
+macro_rules! call_bool {
+    ($name:literal) => {{
+        let got = vm().attach_current_thread(|env| {
+            env.call_static_method(
+                jni::jni_str!("io/github/yebei199/btrearm/Rearm"),
+                jni::jni_str!($name),
+                jni::jni_sig!("()Z"),
+                &[],
+            )?
+            .z()
+        });
+        got.unwrap_or(false)
+    }};
+}
+
 /// 收一个字符串参数、无返回值的静态方法。
 macro_rules! call_with_str {
     ($name:literal, $arg:expr) => {{
@@ -209,6 +234,8 @@ pub fn run(android_app: slint::android::AndroidApp) {
             let Some(ui) = ui.upgrade() else { return };
             ui.set_devices(ModelRc::new(VecModel::from(rows())));
             ui.set_events(ModelRc::new(VecModel::from(events())));
+            ui.set_privileged(call_string!("privilegedStatus").into());
+            ui.set_privileged_ready(call_bool!("privilegedReady"));
         }
     };
 

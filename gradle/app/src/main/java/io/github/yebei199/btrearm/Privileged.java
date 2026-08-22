@@ -88,6 +88,25 @@ final class Privileged {
     }
 
     /**
+     * 特权连接当前的可用状态,一句话,常驻显示在界面上。
+     *
+     * <p>不常驻的话:平板重启后 Shizuku 不会自启,应用会安静地退回自建链路 ——
+     * 那条链路换不来系统接管,等于没用,而用户只会觉得「又不灵了」。
+     */
+    static String status() {
+        if (!Shizuku.pingBinder()) return "特权连接:Shizuku 未运行";
+        if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+            return "特权连接:未授权";
+        }
+        return service != null ? "特权连接:已就绪" : "特权连接:正在绑定服务";
+    }
+
+    /** 状态是否为可用,界面据此上色。 */
+    static boolean ready() {
+        return service != null;
+    }
+
+    /**
      * 请系统连接这台设备。
      *
      * @return 一行结果进日志;服务尚未就绪时返回 null,由调用方决定怎么退让

@@ -67,7 +67,12 @@ public final class PrivilegedConnect extends IPrivilegedConnect.Stub {
             }
             BluetoothDevice device = adapter.getRemoteDevice(mac);
             Method connect = BluetoothDevice.class.getMethod("connect");
-            return "系统连接 " + mac + " -> " + connect.invoke(device);
+            Object code = connect.invoke(device);
+            // 返回 0 只表示请求被受理:手柄不在时它照样返回 0。真正的成功信号是
+            // 随后系统报上来的连接状态,措辞上不能让这一行读起来像连上了。
+            return Integer.valueOf(0).equals(code)
+                    ? "已请求系统连接 " + mac
+                    : "系统连接被拒 " + mac + " 码=" + code;
         } catch (Throwable t) {
             Throwable cause = t.getCause() == null ? t : t.getCause();
             return "系统连接失败 " + mac + ": " + cause;
