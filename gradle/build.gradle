@@ -1,2 +1,5 @@
-// 空的根构建脚本:插件版本在 settings.gradle 的 pluginManagement 里定,
-// 模块配置在 app/build.gradle 里。AGP 要求根项目存在这个文件。
+// 只声明插件版本,不应用 —— 由 app 模块自己 apply。
+// 仓库地址在 settings.gradle 的 pluginManagement 里。
+plugins {
+    id 'com.android.application' version '8.7.3' apply false
+}

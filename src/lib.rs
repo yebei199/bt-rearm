@@ -146,7 +146,7 @@ mod app {
 
     fn list(vm: &JavaVM) -> String {
         let got = vm.attach_current_thread(|env| {
-            let s = env
+            let obj = env
                 .call_static_method(
                     jni::jni_str!(
                         "io/github/yebei199/btrearm/Rearm"
@@ -156,9 +156,11 @@ mod app {
                     &[],
                 )?
                 .l()?;
-            let s =
-                jni::objects::JString::from(s);
-            Ok(env.get_string(&s)?.into())
+            // 返回值静态类型是 JObject,签名保证它其实是 String。
+            // jni 0.22 里这一步走 as_cast,`JString::from` 不存在。
+            let s = env
+                .as_cast::<jni::objects::JString>(&obj)?;
+            s.try_to_string(env)
         });
         match got {
             Ok(s) => s,

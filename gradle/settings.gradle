@@ -1,6 +1,5 @@
-plugins {
-    id 'com.android.application' version '8.7.3' apply false
-}
+// pluginManagement 必须是本文件的第一条语句,插件版本声明在根 build.gradle。
+//
 // 镜像放在 google()/mavenCentral() 之前:gradle 按声明顺序挨个试,命中即止。
 // 直连 dl.google.com 的部分 IP 在国内被黑洞,gradle 只能干等 TCP 超时。
 // 保留官方源作兜底,阿里云偶尔缺件时自动回落。
