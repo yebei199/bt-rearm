@@ -39,6 +39,14 @@ import java.util.Set;
  */
 public final class Rearm {
 
+    static {
+        // NativeActivity 加载 libbtrearm 走的是原生侧 dlopen,不会把库登记进
+        // 应用的 ClassLoader —— ART 解析下面的 native 方法时按 ClassLoader 找
+        // 符号,找不到就抛 UnsatisfiedLinkError。这里从 Java 侧 load 一次完成
+        // 登记;NativeActivity 随后的 dlopen 只是同一库的引用计数 +1。
+        System.loadLibrary("btrearm");
+    }
+
     private static Context ctx;
     /** 当前挂着的 GATT 客户端,按 MAC 存,断开时释放。 */
     private static final Map<String, BluetoothGatt> gatts = new HashMap<>();
