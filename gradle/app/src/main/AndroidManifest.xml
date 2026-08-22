@@ -43,5 +43,14 @@
             android:name=".RearmService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <!-- Shizuku 靠它把绑定器递进来,是借 shell 身份连接的前提。 -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
     </application>
 </manifest>

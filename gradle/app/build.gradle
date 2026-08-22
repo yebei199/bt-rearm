@@ -33,6 +33,11 @@ android {
         }
     }
 
+    buildFeatures {
+        // Shizuku 的用户服务是跨进程的,接口得用 aidl 描述。
+        aidl true
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
@@ -40,5 +45,8 @@ android {
 }
 
 dependencies {
-    // none —— 只用安卓框架自带 API
+    // 借 Shizuku 的 shell 身份调用系统的连接接口 —— 该接口要 BLUETOOTH_PRIVILEGED
+    // 与 MODIFY_PHONE_STATE,普通应用永远拿不到,而 shell 两个都有。
+    implementation 'dev.rikka.shizuku:api:13.1.5'
+    implementation 'dev.rikka.shizuku:provider:13.1.5'
 }

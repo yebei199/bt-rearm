@@ -60,6 +60,8 @@ public class MainActivity extends NativeActivity {
     }
 
     private void ready() {
+        // 特权连接要等 Shizuku 的绑定器到位,越早挂上监听越好。
+        Privileged.init(this);
         // 权限到手之前发起的开扫必然失败,这里让 Rust 按当前名单重来一次。
         Rearm.resumeScan();
         // 布防活在进程里,进程要活过切后台 —— 前台服务是那张「别冻我」的凭据。

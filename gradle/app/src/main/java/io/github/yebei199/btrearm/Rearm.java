@@ -191,6 +191,13 @@ public final class Rearm {
             nativeOnError(mac + " 不在已配对列表里");
             return;
         }
+        // 首选:借 Shizuku 的 shell 身份让系统自己接管 —— 这是唯一能真正换来
+        // 系统「已连接」、手柄可用的路径。不可用时才退回下面两条自救手段。
+        String privileged = Privileged.connect(mac);
+        if (privileged != null) {
+            nativeOnError(privileged);
+            return;
+        }
         // 借系统自己的策略逻辑来发起连接:PhonePolicy 监听 ACTION_UUID,一收到就
         // 检查该设备的 HID 连接策略,若为「未知」便设成「允许」—— 而 HidHostService
         // 把策略设成「允许」这个动作本身会直接调用 connect(device)。也就是说,只要
@@ -331,6 +338,11 @@ public final class Rearm {
                 TICKER.postDelayed(this, TICK_MS);
             }
         });
+    }
+
+    /** 供同包内其它类往界面日志写一行。 */
+    static void note(String line) {
+        nativeOnError(line);
     }
 
     // ---- Java 转给 Rust 的事件 ----
