@@ -22,6 +22,8 @@ import android.os.Looper;
 import android.os.ParcelUuid;
 import android.view.InputDevice;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -65,6 +67,10 @@ public final class Rearm {
     private static final long TICK_MS = 10_000L;
     private static final UUID HID_SERVICE = UUID.fromString("00001812-0000-1000-8000-00805f9b34fb");
     private static final UUID BATTERY_SERVICE = UUID.fromString("0000180f-0000-1000-8000-00805f9b34fb");
+    /** {@code BluetoothProfile.HID_HOST}:常量本身是隐藏的,值写死。 */
+    private static final int PROFILE_HID_HOST = 4;
+    /** HID 主机 profile 代理,异步拿到,见 {@link #systemConnect}。 */
+    private static volatile BluetoothProfile hidHost;
 
     private Rearm() {}
 
@@ -76,6 +82,20 @@ public final class Rearm {
         f.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
         f.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
         ctx.registerReceiver(ACL, f);
+        BluetoothAdapter a = adapter();
+        if (a != null) {
+            a.getProfileProxy(ctx, new BluetoothProfile.ServiceListener() {
+                @Override
+                public void onServiceConnected(int profile, BluetoothProfile proxy) {
+                    hidHost = proxy;
+                }
+
+                @Override
+                public void onServiceDisconnected(int profile) {
+                    hidHost = null;
+                }
+            }, PROFILE_HID_HOST);
+        }
     }
 
     private static final BluetoothGattCallback CALLBACK = new BluetoothGattCallback() {
@@ -182,6 +202,7 @@ public final class Rearm {
             nativeOnError(mac + " 不在已配对列表里");
             return;
         }
+        nativeOnError(systemConnect(d));
         // autoConnect=true:BLE 里连接只能由广播触发 —— 外设睡着时 autoConnect=false
         // 的即时连接必然失败(实测每 10 秒试一次,一次都连不上)。true 是把设备挂进
         // 系统的后台等待名单,它一广播就自动接上,这正是"布防"要的语义。
@@ -192,6 +213,55 @@ public final class Rearm {
             gatts.put(mac, d.connectGatt(ctx, true, CALLBACK, BluetoothDevice.TRANSPORT_LE));
         } catch (SecurityException e) {
             nativeOnError("连接 " + mac + " 失败: " + e);
+        }
+    }
+
+    /**
+     * 复刻设置里那个「连接」按钮。
+     *
+     * <p>设置点下去走的是 {@code BluetoothDevice.connect()} —— 让系统栈把这台设备
+     * 启用的所有 profile(手柄就是 HOGP)都接上,这才是我们真正要的那个动作。它标了
+     * {@code @SystemApi},公开 SDK 编译不到,只能反射;能不能调通取决于两道门:
+     * 隐藏 API 名单(调不到会抛 NoSuchMethodException)和 BLUETOOTH_PRIVILEGED
+     * 权限检查(调得到但没权限会抛 SecurityException)。两道门的失败信息不一样,
+     * 原样写进界面日志,由它告诉我们卡在哪一道。
+     *
+     * <p>退一步还有 HID_HOST profile 代理的 {@code connect(device)},那是同一件事的
+     * 另一个入口,顺带一起试,免得多跑一轮真机。
+     *
+     * @return 一行结果,直接进界面日志
+     */
+    private static String systemConnect(BluetoothDevice d) {
+        StringBuilder sb = new StringBuilder("系统连接: ");
+        sb.append("device.connect()=").append(reflectConnect(BluetoothDevice.class, d, d));
+        if (hidHost != null) {
+            sb.append(" hid.connect()=")
+                    .append(reflectConnect(hidHost.getClass(), hidHost, d));
+        } else {
+            sb.append(" hid=代理未就绪");
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 在 {@code owner} 上反射调用 {@code connect} —— 参数要么没有(设备自身的
+     * connect),要么是一台设备(profile 代理的 connect)。
+     *
+     * @return 返回值,或失败原因;两者都短到能塞进一行日志
+     */
+    private static String reflectConnect(Class<?> cls, Object target, BluetoothDevice arg) {
+        boolean onDevice = target == arg;
+        try {
+            Method m = onDevice
+                    ? cls.getMethod("connect")
+                    : cls.getMethod("connect", BluetoothDevice.class);
+            Object r = onDevice ? m.invoke(target) : m.invoke(target, arg);
+            return String.valueOf(r);
+        } catch (InvocationTargetException e) {
+            // 方法调到了但内部抛了 —— 真正的原因在 cause 里,多半是权限。
+            return String.valueOf(e.getCause());
+        } catch (Throwable t) {
+            return String.valueOf(t);
         }
     }
 
