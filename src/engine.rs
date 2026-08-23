@@ -115,6 +115,8 @@ pub struct Engine {
     waiting_since: HashMap<String, u64>,
     /// 本次链路已经发过低延迟请求的设备。断开即清。
     low_latency_sent: HashSet<String>,
+    /// 平台说「这台不在已配对列表里」的设备。没有配对记录,连接无从谈起。
+    unpaired: HashSet<String>,
     log: Vec<Entry>,
 }
 
@@ -382,6 +384,21 @@ impl Engine {
         privileged_ready: bool,
         now_ms: u64,
     ) -> Option<String> {
+        // 配对记录没了是确定的事实,不像「久等不回」那样需要先观望 —— 观望
+        // 只是让用户多困惑几分钟,而这件事无论如何都得他去处理。
+        let mut lost: Vec<&str> = self
+            .armed
+            .iter()
+            .filter(|m| self.unpaired.contains(*m))
+            .map(|m| m.as_str())
+            .collect();
+        if !lost.is_empty() {
+            lost.sort();
+            return Some(format!(
+                "{} 的配对记录不在了,要到系统设置里重新配对",
+                lost.join("、")
+            ));
+        }
         let mut stale: Vec<&str> = self
             .armed
             .iter()
@@ -417,6 +434,35 @@ impl Engine {
             "{} 已断开较久,自动重连没能接回,可能需要开机",
             stale.join("、")
         ))
+    }
+
+    /// 平台报告这台设备已经不在配对列表里了。
+    ///
+    /// 配对记录是这一切的地基:没有它,系统的连接接口无从谈起,扫到广播也没用。
+    /// 记下来是为了立刻停扫 —— 否则会为一台不存在的设备满占空比空转,而旁边
+    /// 往往还有别的设备正连着,那是在白抢射频。
+    pub fn on_unpaired(&mut self, mac: &str, now_ms: u64) {
+        if self.unpaired.insert(mac.to_string()) {
+            self.note(
+                now_ms,
+                format!("{mac} 配对记录不在了"),
+            );
+        }
+    }
+
+    /// 配对记录又回来了,恢复正常工作。
+    pub fn on_paired(&mut self, mac: &str, now_ms: u64) {
+        if self.unpaired.remove(mac) {
+            // 重新配好就当作刚开始等它,免得沿用几小时前的起点直接触发提醒。
+            self.waiting_since
+                .insert(mac.to_string(), now_ms);
+            self.note(now_ms, format!("{mac} 已重新配对"));
+        }
+    }
+
+    /// 这台设备当前有没有配对记录。安卓那侧据此决定要不要去问平台。
+    pub fn is_unpaired(&self, mac: &str) -> bool {
+        self.unpaired.contains(mac)
     }
 
     /// 当前布防名单,给存盘用。
@@ -525,6 +571,8 @@ impl Engine {
             .armed
             .iter()
             .filter(|mac| !self.connected.contains(*mac))
+            // 没有配对记录的设备扫到了也用不上。
+            .filter(|mac| !self.unpaired.contains(*mac))
             // 连接已经发出去的那几秒也别扫。那段时间收到的广播引擎一律按
             // 「连接中」跳过,扫了也不会被采纳;而满占空比扫描一直占着接收机,
             // 系统的连接发起器要用同一个射频去等对方的广播。

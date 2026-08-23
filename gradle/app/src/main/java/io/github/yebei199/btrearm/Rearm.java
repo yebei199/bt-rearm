@@ -276,6 +276,9 @@ public final class Rearm {
         BluetoothDevice d = bonded(mac);
         if (d == null) {
             log(mac + " 不在已配对列表里");
+            // 配对记录是这一切的地基。告诉引擎,它会停扫并弹通知让用户去重新
+            // 配对 —— 否则应用会为一台不存在的设备满占空比空转下去。
+            nativeOnUnpaired(mac);
             return;
         }
         // 首选:借 Shizuku 的 shell 身份让系统自己接管 —— 这是唯一能真正换来
@@ -547,6 +550,11 @@ public final class Rearm {
         return Privileged.ready();
     }
 
+    /** 这台设备还在已配对列表里吗。配对记录没了之后,引擎靠它判断何时恢复。 */
+    public static boolean isBonded(String mac) {
+        return bonded(mac) != null;
+    }
+
     /** 蓝牙开着没有。引擎拿它判断该不该喊人来开。 */
     public static boolean bluetoothOn() {
         BluetoothAdapter a = adapter();
@@ -608,6 +616,8 @@ public final class Rearm {
     private static native void nativeOnError(String message);
 
     private static native void nativeOnScanFailed();
+
+    private static native void nativeOnUnpaired(String mac);
 
     /**
      * 往应用内日志写一行,同时抄一份进 logcat。

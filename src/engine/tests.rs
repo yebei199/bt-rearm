@@ -796,3 +796,41 @@ fn keepalive_goes_out_when_the_switch_is_on() {
         "对外发不发,只取决于总开关"
     );
 }
+
+#[test]
+fn unpaired_device_is_not_scanned_for() {
+    // 配对记录没了,connect() 无从谈起 —— 再扫也只是白占射频,而旁边还有
+    // 别的设备正连着。
+    let mut e = armed_engine();
+    e.on_unpaired(PAD, 1_000);
+    assert_eq!(e.scan_command(1_000), Scan::Stop);
+}
+
+#[test]
+fn unpaired_device_asks_the_user_to_pair_again() {
+    // 这件事只有人能解决,而且它是确定的事实,不必像「久等不回」那样先观望 ——
+    // 观望六分钟只是让用户多困惑六分钟。
+    let e = {
+        let mut e = armed_engine();
+        e.on_unpaired(PAD, 1_000);
+        e
+    };
+    let msg = e
+        .attention(true, true, 1_000)
+        .expect("该提醒重新配对");
+    assert!(msg.contains("配对"), "{msg}");
+    assert!(msg.contains(PAD), "要指明是哪台: {msg}");
+}
+
+#[test]
+fn pairing_again_puts_the_device_back_to_work() {
+    // 重新配好之后要自己恢复,不该等用户再去点一次布防。
+    let mut e = armed_engine();
+    e.on_unpaired(PAD, 1_000);
+    e.on_paired(PAD, 2_000);
+    assert_eq!(e.attention(true, true, 2_000), None);
+    assert!(matches!(
+        e.scan_command(2_000),
+        Scan::Start { .. }
+    ));
+}

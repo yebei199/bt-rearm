@@ -449,6 +449,14 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeTick<
         let macs = with_engine(|e| e.armed_macs());
         let now = now_ms();
         for mac in macs {
+            // 配对记录没了就什么也做不了,只等它回来 —— 别再扫、别再试连。
+            if with_engine(|e| e.is_unpaired(&mac)) {
+                if call_str_bool!("isBonded", &mac) {
+                    with_engine(|e| e.on_paired(&mac, now));
+                } else {
+                    continue;
+                }
+            }
             let connected = call_is_connected(&mac);
             let action = with_engine(|e| {
                 e.on_tick(&mac, connected, now)
@@ -542,6 +550,24 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnConnectionC
 }
 
 /// Java 侧的异常与失败,原样进日志给用户看。
+/// 平台说这台设备已经不在配对列表里了。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnUnpaired<
+    'c,
+>(
+    mut env: jni::EnvUnowned<'c>,
+    _class: jni::objects::JClass<'c>,
+    mac: jni::objects::JString<'c>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let mac = mac.try_to_string(env)?;
+        with_engine(|e| e.on_unpaired(&mac, now_ms()));
+        update_scan();
+        Ok(())
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
+}
+
 /// 安卓那侧没能把扫描开起来 —— 蓝牙关着、权限被撤,或者平台回了错误码。
 ///
 /// 必须报回来:引擎记的是「我下发过什么」,不报的话目标状态没变就再也不重下,
