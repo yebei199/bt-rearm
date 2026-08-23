@@ -102,6 +102,7 @@ public final class Rearm {
                 }
                 return;
             }
+            applyHighPriority(mac, g);
         }
 
     };
@@ -234,6 +235,54 @@ public final class Rearm {
             } catch (SecurityException e) {
                 nativeOnError("连接 " + mac + " 失败: " + e);
             }
+        }
+    }
+
+    /**
+     * 请求把链路的连接参数压到低延迟档。
+     *
+     * <p>连接间隔决定输入延迟。系统建链时用的是保守的默认参数,实测手柄要等
+     * 几秒才变跟手 —— 那几秒里是游戏或系统随后去请求了高优先级。我们主动请求,
+     * 把这段等待去掉。
+     *
+     * <p>连接参数是**整条链路**的属性,不是某个客户端私有的,所以我们这个 GATT
+     * 客户端提的请求同样作用于系统的 HID 链路。客户端要一直挂着:关掉之后栈可能
+     * 把参数恢复成默认档。注意它与扫描是两回事 —— 附在已有链路上的 GATT 客户端
+     * 不增加额外的射频占用,而扫描会。
+     *
+     * <p>要不要对某台设备做,由 Rust 引擎判断(只对布防中且已连上的设备做)。
+     */
+    public static void requestLowLatency(String mac) {
+        BluetoothGatt existing;
+        synchronized (Rearm.class) {
+            existing = gatts.get(mac);
+        }
+        if (existing != null) {
+            applyHighPriority(mac, existing);
+            return;
+        }
+        BluetoothDevice d = bonded(mac);
+        if (d == null) return;
+        try {
+            // 设备此刻已由系统连着,autoConnect=false 会立刻附到现有链路上,
+            // 连上后回调里再提参数请求。
+            BluetoothGatt g =
+                    d.connectGatt(ctx, false, CALLBACK, BluetoothDevice.TRANSPORT_LE);
+            synchronized (Rearm.class) {
+                gatts.put(mac, g);
+            }
+        } catch (SecurityException e) {
+            nativeOnError("请求低延迟失败: " + e);
+        }
+    }
+
+    private static void applyHighPriority(String mac, BluetoothGatt g) {
+        try {
+            boolean accepted =
+                    g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH);
+            nativeOnError((accepted ? "已请求低延迟 " : "低延迟请求被拒 ") + mac);
+        } catch (SecurityException e) {
+            nativeOnError("请求低延迟失败: " + e);
         }
     }
 

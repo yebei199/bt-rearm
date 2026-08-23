@@ -118,10 +118,12 @@ static VM: OnceLock<JavaVM> = OnceLock::new();
 /// 无参、无返回值的静态方法。
 macro_rules! call_void {
     ($name:literal) => {{
-        let done: jni::errors::Result<()> =
-            vm().attach_current_thread(|env| {
+        let done: jni::errors::Result<()> = vm()
+            .attach_current_thread(|env| {
                 env.call_static_method(
-                    jni::jni_str!("io/github/yebei199/btrearm/Rearm"),
+                    jni::jni_str!(
+                        "io/github/yebei199/btrearm/Rearm"
+                    ),
                     jni::jni_str!($name),
                     jni::jni_sig!("()V"),
                     &[],
@@ -168,7 +170,9 @@ macro_rules! call_bool {
     ($name:literal) => {{
         let got = vm().attach_current_thread(|env| {
             env.call_static_method(
-                jni::jni_str!("io/github/yebei199/btrearm/Rearm"),
+                jni::jni_str!(
+                    "io/github/yebei199/btrearm/Rearm"
+                ),
                 jni::jni_str!($name),
                 jni::jni_sig!("()Z"),
                 &[],
@@ -182,11 +186,13 @@ macro_rules! call_bool {
 /// 收一个字符串参数、无返回值的静态方法。
 macro_rules! call_with_str {
     ($name:literal, $arg:expr) => {{
-        let done: jni::errors::Result<()> =
-            vm().attach_current_thread(|env| {
+        let done: jni::errors::Result<()> = vm()
+            .attach_current_thread(|env| {
                 let s = env.new_string($arg)?;
                 env.call_static_method(
-                    jni::jni_str!("io/github/yebei199/btrearm/Rearm"),
+                    jni::jni_str!(
+                        "io/github/yebei199/btrearm/Rearm"
+                    ),
                     jni::jni_str!($name),
                     jni::jni_sig!("(Ljava/lang/String;)V"),
                     &[(&s).into()],
@@ -199,7 +205,6 @@ macro_rules! call_with_str {
     }};
 }
 
-
 pub fn run(android_app: slint::android::AndroidApp) {
     android_logger::init_once(
         android_logger::Config::default()
@@ -209,11 +214,14 @@ pub fn run(android_app: slint::android::AndroidApp) {
 
     // SAFETY:`vm_as_ptr` 返回的是 android-activity 在 `android_main` 之前就拿到的
     // 那个 JavaVM 指针,进程存续期间一直有效。
-    let vm = unsafe { JavaVM::from_raw(android_app.vm_as_ptr().cast()) };
+    let vm = unsafe {
+        JavaVM::from_raw(android_app.vm_as_ptr().cast())
+    };
     let _ = VM.set(vm);
     *ENGINE.lock().unwrap() = Some(Engine::new());
 
-    slint::android::init(android_app).expect("slint android init failed");
+    slint::android::init(android_app)
+        .expect("slint android init failed");
 
     // 恢复上次的布防名单,并按引擎的指示开扫。
     let saved: Vec<String> = call_string!("loadArmed")
@@ -222,7 +230,8 @@ pub fn run(android_app: slint::android::AndroidApp) {
         .map(str::to_string)
         .collect();
     if !saved.is_empty() {
-        let cmd = with_engine(|e| e.restore(saved, now_ms()));
+        let cmd =
+            with_engine(|e| e.restore(saved, now_ms()));
         apply(cmd);
     }
 
@@ -232,10 +241,18 @@ pub fn run(android_app: slint::android::AndroidApp) {
         let ui = ui.as_weak();
         move || {
             let Some(ui) = ui.upgrade() else { return };
-            ui.set_devices(ModelRc::new(VecModel::from(rows())));
-            ui.set_events(ModelRc::new(VecModel::from(events())));
-            ui.set_privileged(call_string!("privilegedStatus").into());
-            ui.set_privileged_ready(call_bool!("privilegedReady"));
+            ui.set_devices(ModelRc::new(VecModel::from(
+                rows(),
+            )));
+            ui.set_events(ModelRc::new(VecModel::from(
+                events(),
+            )));
+            ui.set_privileged(
+                call_string!("privilegedStatus").into(),
+            );
+            ui.set_privileged_ready(call_bool!(
+                "privilegedReady"
+            ));
         }
     };
 
@@ -272,10 +289,18 @@ fn with_engine<T>(f: impl FnOnce(&mut Engine) -> T) -> T {
     f(engine)
 }
 
+/// 领到许可就请求把连接参数压到低延迟档。引擎保证每条链路只发一次。
+fn claim_low_latency(mac: &str) {
+    if with_engine(|e| e.take_low_latency_request(mac)) {
+        call_with_str!("requestLowLatency", mac);
+    }
+}
+
 /// 目标扫描状态变了才下发。每个事件都重下的话,安卓侧会不停停扫再开扫,
 /// 那本身就是一次射频扰动。
 fn update_scan() {
-    if let Some(cmd) = with_engine(|e| e.scan_if_changed()) {
+    if let Some(cmd) = with_engine(|e| e.scan_if_changed())
+    {
         apply(cmd);
     }
 }
@@ -283,7 +308,9 @@ fn update_scan() {
 /// 把引擎的扫描指令交给 Java 执行。
 fn apply(cmd: Scan) {
     match cmd {
-        Scan::Start(macs) => call_with_str!("startScan", macs.join("\n")),
+        Scan::Start(macs) => {
+            call_with_str!("startScan", macs.join("\n"))
+        }
         Scan::Stop => call_void!("stopScan"),
     }
 }
@@ -313,7 +340,11 @@ fn events() -> Vec<slint::SharedString> {
     let now = now_ms();
     with_engine(|e| {
         // 新的在上面,一眼看到最近发生了什么。
-        e.log(now).iter().rev().map(|l| l.as_str().into()).collect()
+        e.log(now)
+            .iter()
+            .rev()
+            .map(|l| l.as_str().into())
+            .collect()
     })
 }
 
@@ -330,7 +361,9 @@ fn vm() -> &'static JavaVM {
 
 /// 权限到手后按当前名单重开扫描 —— 在那之前发起的开扫必然失败。
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeResumeScan<'c>(
+pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeResumeScan<
+    'c,
+>(
     mut env: jni::EnvUnowned<'c>,
     _class: jni::objects::JClass<'c>,
 ) {
@@ -348,7 +381,9 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeResumeScan<'c
 /// 还能动的路径。设备不在时它必然失败,所以引擎会把间隔逐次翻倍,并在收到广播
 /// 或连上时清零。
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeTick<'c>(
+pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeTick<
+    'c,
+>(
     mut env: jni::EnvUnowned<'c>,
     _class: jni::objects::JClass<'c>,
 ) {
@@ -357,11 +392,15 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeTick<'c>(
         let now = now_ms();
         for mac in macs {
             let connected = call_is_connected(&mac);
-            let action = with_engine(|e| e.on_tick(&mac, connected, now));
+            let action = with_engine(|e| {
+                e.on_tick(&mac, connected, now)
+            });
             if action == Action::Connect {
                 call_connect(&mac);
             }
             update_scan();
+            // 应用启动时设备可能已经连着,那一刻不会再有连接广播 —— 巡检补发。
+            claim_low_latency(&mac);
         }
         Ok(())
     })
@@ -373,7 +412,9 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeTick<'c>(
 /// `EnvUnowned` 是 jni 为原生方法准备的 FFI 安全入参,且 `with_env` 自带
 /// `catch_unwind` —— panic 穿过 FFI 边界会让整个进程 abort。
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnAdvertisement<'c>(
+pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnAdvertisement<
+    'c,
+>(
     mut env: jni::EnvUnowned<'c>,
     _class: jni::objects::JClass<'c>,
     mac: jni::objects::JString<'c>,
@@ -383,12 +424,14 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnAdvertiseme
         // 连接状态要现问 Java —— 引擎自己不碰安卓 API。
         let connected = call_is_connected(&mac);
         let now = now_ms();
-        let action =
-            with_engine(|e| e.on_advertisement(&mac, connected, now));
+        let action = with_engine(|e| {
+            e.on_advertisement(&mac, connected, now)
+        });
         if action == Action::Connect {
             call_connect(&mac);
         }
         update_scan();
+        claim_low_latency(&mac);
         Ok(())
     })
     .resolve::<jni::errors::LogErrorAndDefault>()
@@ -396,7 +439,9 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnAdvertiseme
 
 /// 连接状态变了。
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnConnectionChange<'c>(
+pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnConnectionChange<
+    'c,
+>(
     mut env: jni::EnvUnowned<'c>,
     _class: jni::objects::JClass<'c>,
     mac: jni::objects::JString<'c>,
@@ -404,10 +449,18 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnConnectionC
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
         let mac = mac.try_to_string(env)?;
-        with_engine(|e| e.on_connection_change(&mac, connected, now_ms()));
+        with_engine(|e| {
+            e.on_connection_change(
+                &mac,
+                connected,
+                now_ms(),
+            )
+        });
         // 连上就停扫、断开就复扫。扫描与已建立的连接共用射频,连着还扫会挤掉
         // 手柄的输入包 —— 卡手与 0x08 监督超时断线都由此而来。
         update_scan();
+        // 刚建的链路用的是保守的连接参数,手感要等几秒才好。主动去压。
+        claim_low_latency(&mac);
         Ok(())
     })
     .resolve::<jni::errors::LogErrorAndDefault>()
@@ -415,7 +468,9 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnConnectionC
 
 /// Java 侧的异常与失败,原样进日志给用户看。
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnError<'c>(
+pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnError<
+    'c,
+>(
     mut env: jni::EnvUnowned<'c>,
     _class: jni::objects::JClass<'c>,
     message: jni::objects::JString<'c>,
@@ -432,7 +487,9 @@ fn call_is_connected(mac: &str) -> bool {
     let got = vm().attach_current_thread(|env| {
         let mac = env.new_string(mac)?;
         env.call_static_method(
-            jni::jni_str!("io/github/yebei199/btrearm/Rearm"),
+            jni::jni_str!(
+                "io/github/yebei199/btrearm/Rearm"
+            ),
             jni::jni_str!("isConnected"),
             jni::jni_sig!("(Ljava/lang/String;)Z"),
             &[(&mac).into()],

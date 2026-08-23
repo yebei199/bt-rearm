@@ -64,6 +64,8 @@ pub struct Engine {
     blind_gap: HashMap<String, u64>,
     /// 上一次下发给安卓侧的扫描指令,用来避免重复下发。
     last_scan: Option<Scan>,
+    /// 本次链路已经发过低延迟请求的设备。断开即清。
+    low_latency_sent: HashSet<String>,
     log: Vec<Entry>,
 }
 
@@ -76,7 +78,11 @@ impl Engine {
     }
 
     /// 用户点了某一行:布防 ↔ 撤防。
-    pub fn toggle(&mut self, mac: &str, now_ms: u64) -> Scan {
+    pub fn toggle(
+        &mut self,
+        mac: &str,
+        now_ms: u64,
+    ) -> Scan {
         if self.armed.remove(mac) {
             self.last_try.remove(mac);
             self.note(now_ms, format!("{mac} 撤防"));
@@ -88,11 +94,18 @@ impl Engine {
     }
 
     /// 进程重启后,从存盘名单恢复布防。
-    pub fn restore(&mut self, macs: Vec<String>, now_ms: u64) -> Scan {
+    pub fn restore(
+        &mut self,
+        macs: Vec<String>,
+        now_ms: u64,
+    ) -> Scan {
         for mac in macs {
             self.armed.insert(mac);
         }
-        self.note(now_ms, format!("恢复布防 {} 台", self.armed.len()));
+        self.note(
+            now_ms,
+            format!("恢复布防 {} 台", self.armed.len()),
+        );
         self.commit_scan()
     }
 
@@ -109,7 +122,10 @@ impl Engine {
         self.sync_connected(mac, system_connected);
         if system_connected {
             // 系统自己连上了就让路 —— 这正是布防该袖手的时候。
-            self.note(now_ms, format!("{mac} 系统已连接,让路"));
+            self.note(
+                now_ms,
+                format!("{mac} 系统已连接,让路"),
+            );
             return Action::Skip("系统已连接");
         }
         // 收到广播意味着设备真的在:退避是为了应付设备不在,不能让它拖慢
@@ -131,27 +147,61 @@ impl Engine {
     /// 存在的理由是后台扫描可能被系统压制,那时广播一条都收不到,盲试是唯一
     /// 还能动的路径。代价是设备不在时它必然失败,所以间隔逐次翻倍 —— 一直
     /// 十秒一次的话,手柄关一夜就是近三千次无效尝试。
-    pub fn on_tick(&mut self, mac: &str, system_connected: bool, now_ms: u64) -> Action {
+    pub fn on_tick(
+        &mut self,
+        mac: &str,
+        system_connected: bool,
+        now_ms: u64,
+    ) -> Action {
         if !self.armed.contains(mac) {
             return Action::Skip("未布防");
         }
         self.sync_connected(mac, system_connected);
         if system_connected {
             self.blind_gap.remove(mac);
-            self.note(now_ms, format!("{mac} 系统已连接,让路"));
+            self.note(
+                now_ms,
+                format!("{mac} 系统已连接,让路"),
+            );
             return Action::Skip("系统已连接");
         }
-        let gap = self.blind_gap.get(mac).copied().unwrap_or(BLIND_GAP_MS);
+        let gap = self
+            .blind_gap
+            .get(mac)
+            .copied()
+            .unwrap_or(BLIND_GAP_MS);
         if let Some(last) = self.last_try.get(mac)
             && now_ms.saturating_sub(*last) < gap
         {
             return Action::Skip("退避中");
         }
         self.last_try.insert(mac.to_string(), now_ms);
-        self.blind_gap
-            .insert(mac.to_string(), (gap * 2).min(BLIND_GAP_MAX_MS));
+        self.blind_gap.insert(
+            mac.to_string(),
+            (gap * 2).min(BLIND_GAP_MAX_MS),
+        );
         self.note(now_ms, format!("{mac} 盲试连接"));
         Action::Connect
+    }
+
+    /// 领取一次「把连接参数压到低延迟档」的许可。
+    ///
+    /// 只对布防中且已连上的设备发:压低连接间隔要双方付出功耗,那是我们为手柄
+    /// 手感做的取舍,不该替用户没布防的设备(比如鼠标)决定。
+    ///
+    /// 每条链路只发一次 —— 参数是链路属性,连上后重复请求既无意义又会刷满日志;
+    /// 断开时清除,下次连上重新发。做成「领取」而非「查询」,是为了让定时巡检也
+    /// 能补发:应用启动时设备可能已经连着,那一刻不会再有连接广播。
+    pub fn take_low_latency_request(
+        &mut self,
+        mac: &str,
+    ) -> bool {
+        if !(self.armed.contains(mac)
+            && self.connected.contains(mac))
+        {
+            return false;
+        }
+        self.low_latency_sent.insert(mac.to_string())
     }
 
     /// 用平台报来的权威状态校正本地记录。
@@ -160,28 +210,41 @@ impl Engine {
     /// 都可能漏掉断开那一条,「已连接」便会永久残留 —— 而扫描按它决定开停,
     /// 于是扫描再也不会恢复,只剩已退避到五分钟一次的盲试兜底。广播路径与盲试
     /// 路径每次都带着平台的当场判断,拿它兜底即可。
-    fn sync_connected(&mut self, mac: &str, system_connected: bool) {
+    fn sync_connected(
+        &mut self,
+        mac: &str,
+        system_connected: bool,
+    ) {
         if system_connected {
             self.connected.insert(mac.to_string());
         } else {
             self.connected.remove(mac);
+            // 链路没了,已发的低延迟请求也随之失效,下次连上要重新发。
+            self.low_latency_sent.remove(mac);
         }
     }
 
     /// 连接状态变了(我们连上的,或链路断了)。
-    pub fn on_connection_change(&mut self, mac: &str, connected: bool, now_ms: u64) {
+    pub fn on_connection_change(
+        &mut self,
+        mac: &str,
+        connected: bool,
+        now_ms: u64,
+    ) {
+        self.sync_connected(mac, connected);
         if connected {
-            self.connected.insert(mac.to_string());
             self.blind_gap.remove(mac);
             self.note(now_ms, format!("{mac} 已连接"));
         } else {
-            self.connected.remove(mac);
             // 断开即清节流:下一条广播要能立刻接管,不必再等窗口 ——
             // 这正是这个工具存在的意义。
             self.last_try.remove(mac);
             // 刚断开时设备多半还在(掉线而非关机),值得积极重试一次。
             self.blind_gap.remove(mac);
-            self.note(now_ms, format!("{mac} 断开,等待广播"));
+            self.note(
+                now_ms,
+                format!("{mac} 断开,等待广播"),
+            );
         }
     }
 
@@ -224,9 +287,13 @@ impl Engine {
         self.log
             .iter()
             .map(|e| {
-                let age = ago(now_ms.saturating_sub(e.at_ms));
+                let age =
+                    ago(now_ms.saturating_sub(e.at_ms));
                 if e.repeat > 1 {
-                    format!("{age}  {} ×{}", e.line, e.repeat)
+                    format!(
+                        "{age}  {} ×{}",
+                        e.line, e.repeat
+                    )
                 } else {
                     format!("{age}  {}", e.line)
                 }
@@ -235,7 +302,11 @@ impl Engine {
     }
 
     /// 安卓侧报上来的错误(扫描失败、权限被拒等)。同样进日志,理由同上。
-    pub fn note_external(&mut self, now_ms: u64, line: String) {
+    pub fn note_external(
+        &mut self,
+        now_ms: u64,
+        line: String,
+    ) {
         self.note(now_ms, line);
     }
 
@@ -344,7 +415,8 @@ mod tests {
     }
 
     #[test]
-    fn advertisement_while_system_already_connected_is_ignored() {
+    fn advertisement_while_system_already_connected_is_ignored()
+     {
         // 系统自己已经连上了就让路,不重复插手。这是用户明确要求的语义。
         let mut e = armed_engine();
         assert_eq!(
@@ -354,7 +426,8 @@ mod tests {
     }
 
     #[test]
-    fn advertisement_from_armed_disconnected_device_triggers_connect() {
+    fn advertisement_from_armed_disconnected_device_triggers_connect()
+     {
         // 正常路径:布防中 + 系统没连 + 收到广播 → 主动连接。
         let mut e = armed_engine();
         assert_eq!(
@@ -364,7 +437,8 @@ mod tests {
     }
 
     #[test]
-    fn repeat_advertisement_within_throttle_window_is_ignored() {
+    fn repeat_advertisement_within_throttle_window_is_ignored()
+     {
         // 手柄一秒能广播几十次,节流窗口内只能发起一次连接,
         // 否则会把正在建立的连接反复打断。
         let mut e = armed_engine();
@@ -373,24 +447,34 @@ mod tests {
             Action::Connect
         );
         assert_eq!(
-            e.on_advertisement(PAD, false, 1_000 + RETRY_GAP_MS - 1),
+            e.on_advertisement(
+                PAD,
+                false,
+                1_000 + RETRY_GAP_MS - 1
+            ),
             Action::Skip("连接中")
         );
     }
 
     #[test]
-    fn advertisement_after_throttle_window_triggers_connect_again() {
+    fn advertisement_after_throttle_window_triggers_connect_again()
+     {
         // 边界:上一次尝试失败后,过了节流窗口必须能再试,不能一次失败就放弃。
         let mut e = armed_engine();
         e.on_advertisement(PAD, false, 1_000);
         assert_eq!(
-            e.on_advertisement(PAD, false, 1_000 + RETRY_GAP_MS),
+            e.on_advertisement(
+                PAD,
+                false,
+                1_000 + RETRY_GAP_MS
+            ),
             Action::Connect
         );
     }
 
     #[test]
-    fn advertisement_after_connection_drops_triggers_connect_again() {
+    fn advertisement_after_connection_drops_triggers_connect_again()
+     {
         // 连上又断开(手柄关机、游戏中掉线)后,下一条广播应重新连接 ——
         // 这是这个工具存在的全部意义。断开即清节流,不必再等窗口。
         let mut e = armed_engine();
@@ -420,13 +504,19 @@ mod tests {
     fn toggle_drives_scan_lifecycle() {
         // 布防名单非空才扫描,空了必须停 —— 扫描是唯一的耗电项。
         let mut e = Engine::new();
-        assert_eq!(e.toggle(PAD, 0), Scan::Start(vec![PAD.into()]));
+        assert_eq!(
+            e.toggle(PAD, 0),
+            Scan::Start(vec![PAD.into()])
+        );
         // 第二台加入后要带着两个地址重开扫描,否则新设备不在过滤器里。
         let two = e.toggle(MOUSE, 0);
         match two {
             Scan::Start(mut macs) => {
                 macs.sort();
-                let mut want = vec![PAD.to_string(), MOUSE.to_string()];
+                let mut want = vec![
+                    PAD.to_string(),
+                    MOUSE.to_string(),
+                ];
                 want.sort();
                 assert_eq!(macs, want);
             }
@@ -459,7 +549,10 @@ mod tests {
         let mut e = Engine::new();
         assert_eq!(e.scan_command(), Scan::Stop);
         e.toggle(PAD, 0);
-        assert_eq!(e.scan_command(), Scan::Start(vec![PAD.into()]));
+        assert_eq!(
+            e.scan_command(),
+            Scan::Start(vec![PAD.into()])
+        );
     }
 
     #[test]
@@ -468,7 +561,9 @@ mod tests {
         // 否则界面显示"等待广播"而实际上扫描根本没起来。
         let mut e = Engine::new();
         e.note_external(0, "扫描失败,错误码 2".into());
-        assert!(e.log(0).iter().any(|l| l.contains("错误码 2")));
+        assert!(
+            e.log(0).iter().any(|l| l.contains("错误码 2"))
+        );
     }
 
     #[test]
@@ -480,11 +575,59 @@ mod tests {
         }
         assert_eq!(e.log(0).len(), LOG_CAP);
         // 保留的是最近的,最早那条应被挤掉。
-        assert!(e.log(0).iter().all(|l| !l.ends_with("第 0 条")));
+        assert!(
+            e.log(0)
+                .iter()
+                .all(|l| !l.ends_with("第 0 条"))
+        );
     }
 
     #[test]
-    fn tick_clears_a_stale_connected_flag_and_scanning_resumes() {
+    fn connected_armed_device_wants_low_latency() {
+        // 系统建链时用的是保守的连接参数,输入延迟明显偏高,实测要等几秒才
+        // 自行变好(推测是游戏或系统随后请求了高优先级)。布防的设备一连上
+        // 就该由我们主动去压,而不是让用户等。
+        let mut e = armed_engine();
+        assert!(
+            !e.take_low_latency_request(PAD),
+            "还没连上时不该动参数"
+        );
+        e.on_connection_change(PAD, true, 1_000);
+        assert!(e.take_low_latency_request(PAD));
+    }
+
+    #[test]
+    fn low_latency_is_requested_once_per_link() {
+        // 参数是链路属性,连上后重复请求既无意义又会刷满日志;断开重连要能再发。
+        let mut e = armed_engine();
+        e.on_connection_change(PAD, true, 1_000);
+        assert!(e.take_low_latency_request(PAD));
+        assert!(
+            !e.take_low_latency_request(PAD),
+            "同一条链路不该重复请求"
+        );
+
+        e.on_connection_change(PAD, false, 2_000);
+        e.on_connection_change(PAD, true, 3_000);
+        assert!(
+            e.take_low_latency_request(PAD),
+            "重连后要重新请求"
+        );
+    }
+
+    #[test]
+    fn unarmed_device_keeps_its_own_connection_parameters()
+    {
+        // 没布防的设备是别人的链路,不该被我们改连接参数 —— 压低间隔要付出
+        // 双方的功耗,不是我们该替鼠标做的决定。
+        let mut e = armed_engine();
+        e.on_connection_change(MOUSE, true, 1_000);
+        assert!(!e.take_low_latency_request(MOUSE));
+    }
+
+    #[test]
+    fn tick_clears_a_stale_connected_flag_and_scanning_resumes()
+     {
         // 断开广播可能丢失:进程被冻结、被杀后重启、广播风暴时都会漏。
         // on_tick 每次都从平台拿到权威的连接状态,必须用它把残留的「已连接」
         // 清掉 —— 否则引擎永远认为设备连着,扫描再也不会恢复,只剩已退避到
@@ -534,7 +677,8 @@ mod tests {
     }
 
     #[test]
-    fn scan_is_not_reissued_while_the_target_set_is_unchanged() {
+    fn scan_is_not_reissued_while_the_target_set_is_unchanged()
+     {
         // 每个事件都重下扫描指令的话,安卓侧会不停地停扫再开扫,
         // 那本身就是一次射频扰动。只在目标集合变化时下发。
         let mut e = armed_engine();
@@ -559,7 +703,10 @@ mod tests {
         // 手柄关机时盲试注定失败。固定十秒一次的话,一夜就是近三千次无效尝试,
         // 每次都让控制器去找一个不存在的设备。间隔要逐次拉长。
         let mut e = armed_engine();
-        assert_eq!(e.on_tick(PAD, false, 0), Action::Connect);
+        assert_eq!(
+            e.on_tick(PAD, false, 0),
+            Action::Connect
+        );
         // 第一次之后间隔翻倍,原间隔到点时还不该动。
         assert_eq!(
             e.on_tick(PAD, false, BLIND_GAP_MS),
@@ -581,7 +728,10 @@ mod tests {
             at += BLIND_GAP_MAX_MS;
         }
         // 到了上限之后,每隔上限时间必定还会再试一次。
-        assert_eq!(e.on_tick(PAD, false, at), Action::Connect);
+        assert_eq!(
+            e.on_tick(PAD, false, at),
+            Action::Connect
+        );
     }
 
     #[test]
@@ -593,11 +743,19 @@ mod tests {
         e.on_tick(PAD, false, BLIND_GAP_MS * 2);
         // 广播到达,自身触发一次连接并把退避清零。
         assert_eq!(
-            e.on_advertisement(PAD, false, BLIND_GAP_MS * 10),
+            e.on_advertisement(
+                PAD,
+                false,
+                BLIND_GAP_MS * 10
+            ),
             Action::Connect
         );
         assert_eq!(
-            e.on_tick(PAD, false, BLIND_GAP_MS * 10 + BLIND_GAP_MS),
+            e.on_tick(
+                PAD,
+                false,
+                BLIND_GAP_MS * 10 + BLIND_GAP_MS
+            ),
             Action::Connect
         );
     }
@@ -606,7 +764,10 @@ mod tests {
     fn blind_retry_stands_down_while_system_connected() {
         // 系统已经连上就别插手,语义与广播路径一致。
         let mut e = armed_engine();
-        assert_eq!(e.on_tick(PAD, true, 0), Action::Skip("系统已连接"));
+        assert_eq!(
+            e.on_tick(PAD, true, 0),
+            Action::Skip("系统已连接")
+        );
     }
 
     #[test]
@@ -628,7 +789,8 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_duplicate_lines_collapse_into_one_entry() {
+    fn consecutive_duplicate_lines_collapse_into_one_entry()
+    {
         // 手柄不在时每 10 秒重试一次,同一行会把日志刷满,真正有用的
         // 信息被挤出缓冲区。连续重复的只占一条,并标出次数。
         let mut e = Engine::new();
@@ -649,7 +811,11 @@ mod tests {
         e.note_external(0, "发起连接".into());
         assert_eq!(
             e.log(0),
-            ["刚刚  发起连接", "刚刚  已连接", "刚刚  发起连接"]
+            [
+                "刚刚  发起连接",
+                "刚刚  已连接",
+                "刚刚  发起连接"
+            ]
         );
     }
 
