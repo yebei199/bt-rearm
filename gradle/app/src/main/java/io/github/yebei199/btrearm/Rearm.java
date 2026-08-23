@@ -1,5 +1,9 @@
 package io.github.yebei199.btrearm;
 
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGatt;
@@ -59,6 +63,14 @@ public final class Rearm {
     }
 
     private static Context ctx;
+
+    /** 前台保活通知占了 1,这条是提醒用户动手的那条。 */
+    private static final int ATTENTION_ID = 2;
+
+    private static final String ATTENTION_CHANNEL = "rearm-attention";
+
+    /** 上一次弹出的正文,用来避免同一句话反复打扰。 */
+    private static String lastAttention = "";
     /** 当前挂着的 GATT 客户端,按 MAC 存,断开时释放。 */
     private static final Map<String, BluetoothGatt> gatts = new HashMap<>();
     /** 每台设备用于保活的可读特征,服务发现完成后确定。 */
@@ -496,6 +508,49 @@ public final class Rearm {
     /** 特权连接是否可用,界面据此上色。 */
     public static boolean privilegedReady() {
         return Privileged.ready();
+    }
+
+    /** 蓝牙开着没有。引擎拿它判断该不该喊人来开。 */
+    public static boolean bluetoothOn() {
+        BluetoothAdapter a = adapter();
+        return a != null && a.isEnabled();
+    }
+
+    /**
+     * 弹一条「这事只有你能做」的通知;传空串表示事情已经解决,撤掉通知。
+     *
+     * <p>同一句话不重复弹:用户划掉之后,只要状态没变就别再打扰,状态一变
+     * 立刻重新弹出来。判断什么算「需要人管」在 Rust 引擎里,这里只管显示。
+     */
+    public static void notifyAttention(String message) {
+        if (ctx == null || message.equals(lastAttention)) return;
+        lastAttention = message;
+        NotificationManager nm = ctx.getSystemService(NotificationManager.class);
+        if (nm == null) return;
+        if (message.isEmpty()) {
+            nm.cancel(ATTENTION_ID);
+            return;
+        }
+        nm.createNotificationChannel(
+                new NotificationChannel(
+                        ATTENTION_CHANNEL, "需要人工处理", NotificationManager.IMPORTANCE_HIGH));
+        PendingIntent tap =
+                PendingIntent.getActivity(
+                        ctx,
+                        0,
+                        new Intent(ctx, MainActivity.class)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        PendingIntent.FLAG_IMMUTABLE);
+        nm.notify(
+                ATTENTION_ID,
+                new Notification.Builder(ctx, ATTENTION_CHANNEL)
+                        .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                        .setContentTitle("蓝牙布防需要你")
+                        .setContentText(message)
+                        .setStyle(new Notification.BigTextStyle().bigText(message))
+                        .setContentIntent(tap)
+                        .setAutoCancel(true)
+                        .build());
     }
 
     /** 供同包内其它类往界面日志写一行。 */

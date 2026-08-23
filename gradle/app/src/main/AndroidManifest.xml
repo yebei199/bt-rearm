@@ -16,6 +16,7 @@
         android:maxSdkVersion="30" />
 
     <!-- 保活服务。connectedDevice 类型对 targetSdk 34 是强制声明的。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission
         android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />

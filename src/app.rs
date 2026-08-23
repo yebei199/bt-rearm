@@ -299,7 +299,8 @@ fn claim_low_latency(mac: &str) {
 /// 目标扫描状态变了才下发。每个事件都重下的话,安卓侧会不停停扫再开扫,
 /// 那本身就是一次射频扰动。
 fn update_scan() {
-    if let Some(cmd) = with_engine(|e| e.scan_if_changed(now_ms()))
+    if let Some(cmd) =
+        with_engine(|e| e.scan_if_changed(now_ms()))
     {
         apply(cmd);
     }
@@ -422,10 +423,18 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeTick<
             // 应用启动时设备可能已经连着,那一刻不会再有连接广播 —— 巡检补发。
             claim_low_latency(&mac);
             // 保活:试探手柄固件认不认平板发来的数据算「有活动」,从而推迟休眠。
-            if with_engine(|e| e.take_keepalive(&mac, now)) {
+            if with_engine(|e| e.take_keepalive(&mac, now))
+            {
                 call_with_str!("keepAlive", &mac);
             }
         }
+        // 自动那条路走不通时喊人。两个事实只有安卓那侧知道,取来交给引擎判断。
+        let bt_on = call_bool!("bluetoothOn");
+        let ready = call_bool!("privilegedReady");
+        let word =
+            with_engine(|e| e.attention(bt_on, ready, now))
+                .unwrap_or_default();
+        call_with_str!("notifyAttention", &word);
         Ok(())
     })
     .resolve::<jni::errors::LogErrorAndDefault>()

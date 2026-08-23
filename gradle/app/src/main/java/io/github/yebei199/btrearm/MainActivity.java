@@ -8,6 +8,9 @@ import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
  * 极薄的 NativeActivity 子类。界面与布防决策都在 Rust 里,这里只负责三件事:
  * 把 Context 交给 {@link Rearm}、要蓝牙权限、权限到手后通知 Rust 重开扫描
@@ -32,15 +35,20 @@ public class MainActivity extends NativeActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        if (Build.VERSION.SDK_INT >= 31 && missingBtPermission()) {
-            requestPermissions(
-                    new String[] {
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                        Manifest.permission.BLUETOOTH_SCAN,
-                    },
-                    REQ_BT);
-        } else {
+        // 一次问全:分两次调用的话,系统只会弹出先到的那个,后一个被静默丢弃。
+        List<String> want = new ArrayList<>();
+        if (Build.VERSION.SDK_INT >= 31) {
+            want.add(Manifest.permission.BLUETOOTH_CONNECT);
+            want.add(Manifest.permission.BLUETOOTH_SCAN);
+        }
+        if (Build.VERSION.SDK_INT >= 33) {
+            want.add(Manifest.permission.POST_NOTIFICATIONS);
+        }
+        want.removeIf(p -> checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED);
+        if (want.isEmpty()) {
             ready();
+        } else {
+            requestPermissions(want.toArray(new String[0]), REQ_BT);
         }
     }
 
@@ -54,6 +62,7 @@ public class MainActivity extends NativeActivity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(requestCode, permissions, results);
+        // 通知没批只是收不到提醒,布防照常跑,所以这里只看蓝牙那两项。
         if (requestCode == REQ_BT && !missingBtPermission()) {
             ready();
         }

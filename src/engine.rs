@@ -42,6 +42,13 @@ pub const FAST_SCAN_MS: u64 = 120_000;
 /// 只能实测,所以这是个实验而非确定的修复。一分钟一次足够试探,再密只是白耗电。
 pub const KEEPALIVE_GAP_MS: u64 = 60_000;
 
+/// 断开多久之后,认定「只有人能解决」并弹通知。
+///
+/// 手柄掉线后重试是自动的,几分钟内都算正常波动,这段时间弹通知纯属打扰。
+/// 超过盲试退避的上限还没回来,基本只剩一种解释:手柄已经关机 —— 而按下电源
+/// 键这件事,主机永远做不到。取值略大于退避上限,让自动那条路先走完再喊人。
+pub const ATTENTION_MS: u64 = 360_000;
+
 /// 收到一条广播后,决定要不要动手。
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
@@ -119,7 +126,8 @@ impl Engine {
             self.note(now_ms, format!("{mac} 撤防"));
         } else {
             self.armed.insert(mac.to_string());
-            self.waiting_since.insert(mac.to_string(), now_ms);
+            self.waiting_since
+                .insert(mac.to_string(), now_ms);
             self.note(now_ms, format!("{mac} 布防"));
         }
         self.commit_scan_at(now_ms)
@@ -242,14 +250,19 @@ impl Engine {
     /// 保活是往手柄发一点数据,试探它的固件认不认这算「有活动」,从而推迟自行
     /// 休眠。认不认取决于固件,查不到资料,只能实测 —— 所以这是实验性的。
     /// 没连上时无处可发;没布防的设备不归我们管,别去打扰它的链路。
-    pub fn take_keepalive(&mut self, mac: &str, now_ms: u64) -> bool {
+    pub fn take_keepalive(
+        &mut self,
+        mac: &str,
+        now_ms: u64,
+    ) -> bool {
         if !(self.armed.contains(mac)
             && self.connected.contains(mac))
         {
             return false;
         }
         if let Some(last) = self.last_keepalive.get(mac)
-            && now_ms.saturating_sub(*last) < KEEPALIVE_GAP_MS
+            && now_ms.saturating_sub(*last)
+                < KEEPALIVE_GAP_MS
         {
             return false;
         }
@@ -281,7 +294,8 @@ impl Engine {
         }
         if self.connected.remove(mac) {
             // 从「连着」跌到「没连」的那一刻,才是开始等它回来的起点。
-            self.waiting_since.insert(mac.to_string(), now_ms);
+            self.waiting_since
+                .insert(mac.to_string(), now_ms);
         }
         // 链路没了,已发的低延迟请求也随之失效,下次连上要重新发。
         self.low_latency_sent.remove(mac);
@@ -315,6 +329,60 @@ impl Engine {
                 format!("{mac} 断开,等待广播"),
             );
         }
+    }
+
+    /// 现在有没有非人不可的事,有的话给出一句能直接当通知正文的话。
+    ///
+    /// 判断留在这里而不是安卓那侧,是因为「什么算需要人管」是策略。安卓只负责
+    /// 把两个它才知道的事实(蓝牙开没开、特权身份就绪没有)递进来,再把返回的
+    /// 话显示出去。返回 None 表示一切正常,通知该撤掉。
+    pub fn attention(
+        &self,
+        bt_on: bool,
+        privileged_ready: bool,
+        now_ms: u64,
+    ) -> Option<String> {
+        // 一台都没布防说明用户没在用这个工具,那就什么都别说。
+        let waiting: Vec<&String> = self
+            .armed
+            .iter()
+            .filter(|m| !self.connected.contains(*m))
+            .collect();
+        if self.armed.is_empty() {
+            return None;
+        }
+        if !bt_on {
+            return Some(
+                "蓝牙已关闭,布防中的设备无法回连".into(),
+            );
+        }
+        if !privileged_ready {
+            return Some(
+                "Shizuku 未就绪,回连会退回到成功率很低的普通方式"
+                    .into(),
+            );
+        }
+        // 等待起点缺失的设备(比如刚布防就连上过)不该被算成久等。
+        let mut stale: Vec<&str> = waiting
+            .into_iter()
+            .filter(|m| {
+                self.waiting_since.get(*m).is_some_and(
+                    |since| {
+                        now_ms.saturating_sub(*since)
+                            >= ATTENTION_MS
+                    },
+                )
+            })
+            .map(|m| m.as_str())
+            .collect();
+        if stale.is_empty() {
+            return None;
+        }
+        stale.sort();
+        Some(format!(
+            "{} 已断开较久,自动重连没能接回,可能需要开机",
+            stale.join("、")
+        ))
     }
 
     /// 当前布防名单,给存盘用。
@@ -389,7 +457,10 @@ impl Engine {
     /// 目标扫描状态与上次下发的不同时才返回。
     ///
     /// 每个事件都重下指令的话,安卓侧会不停地停扫再开扫,那本身就是一次射频扰动。
-    pub fn scan_if_changed(&mut self, now_ms: u64) -> Option<Scan> {
+    pub fn scan_if_changed(
+        &mut self,
+        now_ms: u64,
+    ) -> Option<Scan> {
         let want = self.desired_scan(now_ms);
         if self.last_scan.as_ref() == Some(&want) {
             return None;
@@ -414,15 +485,19 @@ impl Engine {
         }
         // 只要还有一台是「刚失去连接不久」,就值得用满占空比把它抢回来。
         let fast = waiting.iter().any(|mac| {
-            self.waiting_since
-                .get(mac)
-                .is_some_and(|since| {
-                    now_ms.saturating_sub(*since) < FAST_SCAN_MS
-                })
+            self.waiting_since.get(mac).is_some_and(
+                |since| {
+                    now_ms.saturating_sub(*since)
+                        < FAST_SCAN_MS
+                },
+            )
         });
         // 顺序稳定,测试与去重都依赖它。
         waiting.sort();
-        Scan::Start { macs: waiting, fast }
+        Scan::Start {
+            macs: waiting,
+            fast,
+        }
     }
 
     fn commit_scan_at(&mut self, now_ms: u64) -> Scan {
@@ -583,7 +658,10 @@ mod tests {
         let mut e = Engine::new();
         assert_eq!(
             e.toggle(PAD, 0),
-            Scan::Start { macs: vec![PAD.into()], fast: true }
+            Scan::Start {
+                macs: vec![PAD.into()],
+                fast: true
+            }
         );
         // 第二台加入后要带着两个地址重开扫描,否则新设备不在过滤器里。
         let two = e.toggle(MOUSE, 0);
@@ -609,7 +687,10 @@ mod tests {
         let mut e = Engine::new();
         assert_eq!(
             e.restore(vec![PAD.into()], 0),
-            Scan::Start { macs: vec![PAD.into()], fast: true }
+            Scan::Start {
+                macs: vec![PAD.into()],
+                fast: true
+            }
         );
         assert!(e.row(PAD).armed);
         assert_eq!(e.armed_macs(), vec![PAD.to_string()]);
@@ -628,7 +709,10 @@ mod tests {
         e.toggle(PAD, 0);
         assert_eq!(
             e.scan_command(0),
-            Scan::Start { macs: vec![PAD.into()], fast: true }
+            Scan::Start {
+                macs: vec![PAD.into()],
+                fast: true
+            }
         );
     }
 
@@ -712,12 +796,16 @@ mod tests {
         e.on_connection_change(PAD, false, 2_000);
         assert_eq!(
             e.scan_if_changed(2_000),
-            Some(Scan::Start { macs: vec![PAD.into()], fast: true })
+            Some(Scan::Start {
+                macs: vec![PAD.into()],
+                fast: true
+            })
         );
     }
 
     #[test]
-    fn scanning_falls_back_to_low_power_once_the_device_stays_away() {
+    fn scanning_falls_back_to_low_power_once_the_device_stays_away()
+     {
         // 过了这段还没回来,手柄多半已经关机,再全速扫只是把电白白烧掉。
         let mut e = armed_engine();
         e.on_connection_change(PAD, true, 1_000);
@@ -726,7 +814,10 @@ mod tests {
         e.scan_if_changed(2_000);
         assert_eq!(
             e.scan_if_changed(2_000 + FAST_SCAN_MS),
-            Some(Scan::Start { macs: vec![PAD.into()], fast: false })
+            Some(Scan::Start {
+                macs: vec![PAD.into()],
+                fast: false
+            })
         );
     }
 
@@ -735,15 +826,23 @@ mod tests {
         // 保活是发给「连着的手柄」的:没连上时发无处可发。节奏也要限住,
         // 每分钟一次足够试探固件,再密只是白耗电。
         let mut e = armed_engine();
-        assert!(!e.take_keepalive(PAD, 0), "没连上时不该发");
+        assert!(
+            !e.take_keepalive(PAD, 0),
+            "没连上时不该发"
+        );
 
         e.on_connection_change(PAD, true, 1_000);
         assert!(e.take_keepalive(PAD, 1_000));
         assert!(
-            !e.take_keepalive(PAD, 1_000 + KEEPALIVE_GAP_MS - 1),
+            !e.take_keepalive(
+                PAD,
+                1_000 + KEEPALIVE_GAP_MS - 1
+            ),
             "未到间隔不该重发"
         );
-        assert!(e.take_keepalive(PAD, 1_000 + KEEPALIVE_GAP_MS));
+        assert!(
+            e.take_keepalive(PAD, 1_000 + KEEPALIVE_GAP_MS)
+        );
     }
 
     #[test]
@@ -755,7 +854,8 @@ mod tests {
     }
 
     #[test]
-    fn hid_view_lag_does_not_restart_scanning_on_a_fresh_link() {
+    fn hid_view_lag_does_not_restart_scanning_on_a_fresh_link()
+     {
         // 两个信号快慢不同:ACL 广播链路一起来就到,而平台的 HID 视图(输入设备
         // 列表)要等 HID profile 完全起来才转真,中间有几秒空窗。让慢的覆盖快的,
         // 扫描就会在链路建立中途被重开 —— 那是射频最紧张的时刻,既拖慢建链,
@@ -783,7 +883,10 @@ mod tests {
         e.on_tick(PAD, false, 1_000 + SETTLE_MS + 1);
         assert_eq!(
             e.scan_if_changed(0),
-            Some(Scan::Start { macs: vec![PAD.into()], fast: true })
+            Some(Scan::Start {
+                macs: vec![PAD.into()],
+                fast: true
+            })
         );
     }
 
@@ -801,7 +904,10 @@ mod tests {
         e.on_tick(PAD, false, 40_000);
         assert_eq!(
             e.scan_if_changed(0),
-            Some(Scan::Start { macs: vec![PAD.into()], fast: true })
+            Some(Scan::Start {
+                macs: vec![PAD.into()],
+                fast: true
+            })
         );
     }
 
@@ -834,7 +940,10 @@ mod tests {
         e.on_connection_change(PAD, false, 2_000);
         assert_eq!(
             e.scan_if_changed(0),
-            Some(Scan::Start { macs: vec![PAD.into()], fast: true })
+            Some(Scan::Start {
+                macs: vec![PAD.into()],
+                fast: true
+            })
         );
     }
 
@@ -856,7 +965,10 @@ mod tests {
         e.on_connection_change(PAD, true, 1_000);
         assert_eq!(
             e.scan_if_changed(0),
-            Some(Scan::Start { macs: vec![MOUSE.into()], fast: true })
+            Some(Scan::Start {
+                macs: vec![MOUSE.into()],
+                fast: true
+            })
         );
     }
 
@@ -996,6 +1108,112 @@ mod tests {
         assert!(
             log.iter().any(|l| l.contains("系统已连接")),
             "日志里应有让路原因: {log:?}"
+        );
+    }
+
+    // ---- 需要人工干预时的提醒 ----
+
+    #[test]
+    fn attention_is_silent_when_nothing_is_armed() {
+        // 用户没布防任何设备时,这个工具就该完全闭嘴 —— 蓝牙关着也不关它的事。
+        let e = Engine::new();
+        assert_eq!(
+            e.attention(false, false, 10_000_000),
+            None
+        );
+    }
+
+    #[test]
+    fn attention_is_silent_while_device_is_connected() {
+        // 连着的时候没有任何要人做的事。
+        let mut e = armed_engine();
+        e.on_connection_change(PAD, true, 1_000);
+        assert_eq!(
+            e.attention(true, true, 10_000_000),
+            None
+        );
+    }
+
+    #[test]
+    fn attention_asks_to_turn_bluetooth_on() {
+        // 蓝牙关了谁也救不回来,只能让用户去开。
+        let e = armed_engine();
+        let msg = e
+            .attention(false, true, 1_000)
+            .expect("该提醒开蓝牙");
+        assert!(msg.contains("蓝牙"), "{msg}");
+    }
+
+    #[test]
+    fn attention_asks_to_start_shizuku() {
+        // 没有特权身份就退回到普通连接,回连成功率大跌,值得让用户去启动 Shizuku。
+        let e = armed_engine();
+        let msg = e
+            .attention(true, false, 1_000)
+            .expect("该提醒 Shizuku");
+        assert!(msg.contains("Shizuku"), "{msg}");
+    }
+
+    #[test]
+    fn attention_prefers_bluetooth_over_shizuku() {
+        // 两个都不满足时先说蓝牙:开了蓝牙才轮得到特权身份起作用。
+        let e = armed_engine();
+        let msg = e.attention(false, false, 1_000).unwrap();
+        assert!(msg.contains("蓝牙"), "{msg}");
+    }
+
+    #[test]
+    fn attention_stays_quiet_during_normal_wait() {
+        // 刚断开的几分钟里正常重试就好,这时候弹通知纯属打扰。
+        let mut e = armed_engine();
+        e.on_connection_change(PAD, true, 1_000);
+        e.on_connection_change(PAD, false, 2_000);
+        assert_eq!(
+            e.attention(
+                true,
+                true,
+                2_000 + ATTENTION_MS - 1
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn attention_asks_to_wake_device_after_long_wait() {
+        // 等了这么久还没回来,基本可以断定手柄已经关机 —— 只有人能按那个键。
+        let mut e = armed_engine();
+        e.on_connection_change(PAD, true, 1_000);
+        e.on_connection_change(PAD, false, 2_000);
+        let msg = e
+            .attention(true, true, 2_000 + ATTENTION_MS)
+            .expect("该提醒去开手柄");
+        assert!(
+            msg.contains(PAD),
+            "提醒里要指明是哪台: {msg}"
+        );
+    }
+
+    #[test]
+    fn attention_clears_once_device_comes_back() {
+        // 回来了就该撤掉通知,而不是留一条过期的提醒在通知栏。
+        let mut e = armed_engine();
+        e.on_connection_change(PAD, true, 1_000);
+        e.on_connection_change(PAD, false, 2_000);
+        let late = 2_000 + ATTENTION_MS;
+        assert!(e.attention(true, true, late).is_some());
+        e.on_connection_change(PAD, true, late);
+        assert_eq!(e.attention(true, true, late), None);
+    }
+
+    #[test]
+    fn attention_ignores_unarmed_device() {
+        // 没布防的设备断着是它自己的事,不该因为它去打扰用户。
+        let mut e = Engine::new();
+        e.toggle(MOUSE, 0);
+        e.toggle(MOUSE, 1_000); // 撤防
+        assert_eq!(
+            e.attention(true, true, 10_000_000),
+            None
         );
     }
 }
