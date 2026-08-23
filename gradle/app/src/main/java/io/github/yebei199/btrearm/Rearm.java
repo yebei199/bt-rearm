@@ -118,6 +118,17 @@ public final class Rearm {
                     closeQuietly(gatts.remove(mac));
                     keepaliveTarget.remove(mac);
                 }
+                // 链路真断了的话,这条回调比 ACL 广播早半秒到 —— 实测断开时刻
+                // 27.383,回调 27.385,而广播驱动的开扫要等到 27.900。那半秒
+                // 占整个回连过程的六分之一,白等太亏。
+                //
+                // 只认非零状态:0 是我们自己关的客户端,链路未必有事;8(监督
+                // 超时)这类才是链路真的没了。报错了也不怕,巡检每十秒拿平台的
+                // 权威状态兜一次底。
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    log("链路断开 " + mac + " 状态 " + status);
+                    nativeOnConnectionChange(mac, false);
+                }
                 return;
             }
             applyHighPriority(mac, g);
