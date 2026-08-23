@@ -26,7 +26,10 @@ public class RearmService extends Service {
                 .setContentTitle("蓝牙布防运行中")
                 .build();
         startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
-        return START_STICKY;
+        // 不用 START_STICKY:布防的引擎与 Context 都随界面创建而初始化,进程被系统
+        // 回收后,单独被拉回来的服务里什么都没有 —— 它会挂着「运行中」的通知却不
+        // 扫描、不重试。那比不工作更糟,因为它在骗人。宁可安静地不在。
+        return START_NOT_STICKY;
     }
 
     @Override
