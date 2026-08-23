@@ -249,9 +249,8 @@ pub fn run(android_app: slint::android::AndroidApp) {
         .map(str::to_string)
         .collect();
     if !saved.is_empty() {
-        let cmd =
-            with_engine(|e| e.restore(saved, now_ms()));
-        apply(cmd);
+        with_engine(|e| e.restore(saved, now_ms()));
+        resync_and_scan();
     }
 
     let ui = App::new().expect("create ui");
@@ -412,11 +411,26 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeResumeScan<
     _class: jni::objects::JClass<'c>,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        let cmd = with_engine(|e| e.scan_command(now_ms()));
-        apply(cmd);
+        resync_and_scan();
         Ok(())
     })
     .resolve::<jni::errors::LogErrorAndDefault>()
+}
+
+/// 问清楚每台布防设备此刻连没连,再决定扫不扫。
+///
+/// 启动路径上必须先做这一步。少了它,应用一起来就会对着一台已经连着的手柄
+/// 满占空比扫描,直到十秒后第一次巡检才纠正 —— 而那正是我们一直在防的射频
+/// 争用:活链路上的扫描窗口会挤掉手柄的输入包,轻则卡手,重则监督超时断线。
+fn resync_and_scan() {
+    let now = now_ms();
+    for mac in with_engine(|e| e.armed_macs()) {
+        let connected = call_is_connected(&mac);
+        with_engine(|e| {
+            e.on_connection_change(&mac, connected, now)
+        });
+    }
+    apply(with_engine(|e| e.scan_command(now_ms())));
 }
 
 /// 定时盲试:对每台布防中的设备碰运气试一次连接。

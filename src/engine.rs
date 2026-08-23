@@ -145,11 +145,15 @@ impl Engine {
     }
 
     /// 进程重启后,从存盘名单恢复布防。
+    /// 只恢复布防名单,不顺手开扫。
+    ///
+    /// 开不开扫要等安卓那侧把每台设备此刻连没连问回来 —— 名单里的设备很可能
+    /// 正连着,这时候开扫就是往活链路上撒扫描窗口,挤掉的是手柄的输入包。
     pub fn restore(
         &mut self,
         macs: Vec<String>,
         now_ms: u64,
-    ) -> Scan {
+    ) {
         for mac in macs {
             self.waiting_since.insert(mac.clone(), now_ms);
             self.armed.insert(mac);
@@ -158,7 +162,6 @@ impl Engine {
             now_ms,
             format!("恢复布防 {} 台", self.armed.len()),
         );
-        self.commit_scan_at(now_ms)
     }
 
     /// 扫到一条广播。`system_connected` 是安卓侧当场查到的连接状态。

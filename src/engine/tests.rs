@@ -47,6 +47,16 @@ fn advertisement_from_armed_disconnected_device_triggers_connect()
 }
 
 #[test]
+fn restored_device_that_is_already_connected_is_not_scanned_for()
+ {
+    // 恢复名单之后安卓报「这台正连着」,那就一次扫描都不该开。
+    let mut e = Engine::new();
+    e.restore(vec![PAD.into()], 0);
+    e.on_connection_change(PAD, true, 0);
+    assert_eq!(e.scan_command(0), Scan::Stop);
+}
+
+#[test]
 fn repeat_advertisement_within_throttle_window_is_ignored()
 {
     // 手柄一秒能广播几十次,节流窗口内只能发起一次连接,
@@ -138,16 +148,11 @@ fn toggle_drives_scan_lifecycle() {
 }
 
 #[test]
-fn restore_arms_saved_devices_and_starts_scan() {
-    // 进程被杀后重启,存盘名单要能恢复成布防状态并重新开扫。
+fn restore_arms_saved_devices_without_scanning_yet() {
+    // 进程被杀后重启,存盘名单要能恢复成布防状态。但开不开扫得等安卓那侧把
+    // 连接状态问回来 —— 名单里的设备很可能正连着,这时候开扫是在自找卡手。
     let mut e = Engine::new();
-    assert_eq!(
-        e.restore(vec![PAD.into()], 0),
-        Scan::Start {
-            macs: vec![PAD.into()],
-            fast: true
-        }
-    );
+    e.restore(vec![PAD.into()], 0);
     assert!(e.row(PAD).armed);
     assert_eq!(e.armed_macs(), vec![PAD.to_string()]);
     assert_eq!(
