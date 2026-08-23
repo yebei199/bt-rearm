@@ -27,6 +27,14 @@ pub const BLIND_GAP_MAX_MS: u64 = 300_000;
 /// 盲试退避的上限,窗口外仍由平台的当场判断兜底,免得回到「扫描永不恢复」。
 pub const SETTLE_MS: u64 = 30_000;
 
+/// 刚失去连接后维持满占空比扫描的时长。
+///
+/// 安卓的省电扫描每 5120 毫秒只听 512 毫秒,九成时间耳朵是闭着的 —— 手柄广播
+/// 得再勤,平均也要两秒多才被撞上,最坏五秒往上。刚掉线那阵子人多半还在用,
+/// 值得用满占空比把这段等待压掉;过了这段仍没回来,说明手柄多半已经关机,
+/// 再全速扫下去只是把电白白烧掉。
+pub const FAST_SCAN_MS: u64 = 120_000;
+
 /// 两次保活之间的间隔。
 ///
 /// 手柄闲置一段时间会自行休眠,那是它固件里的计时器,平板改不了。能试的只有
@@ -47,7 +55,9 @@ pub enum Action {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scan {
     /// 按这批地址开扫(名单变化时也用它,等价于换过滤器重开)。
-    Start(Vec<String>),
+    ///
+    /// `fast` 为真时用满占空比:刚掉线那阵子要抢时间,省电模式九成时间听不见。
+    Start { macs: Vec<String>, fast: bool },
     /// 名单空了,停扫 —— 扫描是这里唯一的耗电项。
     Stop,
 }
@@ -83,6 +93,8 @@ pub struct Engine {
     acl_since: HashMap<String, u64>,
     /// 各设备上次发保活的时刻。
     last_keepalive: HashMap<String, u64>,
+    /// 各设备开始「等着它回来」的时刻:布防那一刻,或失去连接那一刻。
+    waiting_since: HashMap<String, u64>,
     /// 本次链路已经发过低延迟请求的设备。断开即清。
     low_latency_sent: HashSet<String>,
     log: Vec<Entry>,
@@ -107,9 +119,10 @@ impl Engine {
             self.note(now_ms, format!("{mac} 撤防"));
         } else {
             self.armed.insert(mac.to_string());
+            self.waiting_since.insert(mac.to_string(), now_ms);
             self.note(now_ms, format!("{mac} 布防"));
         }
-        self.commit_scan()
+        self.commit_scan_at(now_ms)
     }
 
     /// 进程重启后,从存盘名单恢复布防。
@@ -119,13 +132,14 @@ impl Engine {
         now_ms: u64,
     ) -> Scan {
         for mac in macs {
+            self.waiting_since.insert(mac.clone(), now_ms);
             self.armed.insert(mac);
         }
         self.note(
             now_ms,
             format!("恢复布防 {} 台", self.armed.len()),
         );
-        self.commit_scan()
+        self.commit_scan_at(now_ms)
     }
 
     /// 扫到一条广播。`system_connected` 是安卓侧当场查到的连接状态。
@@ -265,7 +279,10 @@ impl Engine {
         {
             return;
         }
-        self.connected.remove(mac);
+        if self.connected.remove(mac) {
+            // 从「连着」跌到「没连」的那一刻,才是开始等它回来的起点。
+            self.waiting_since.insert(mac.to_string(), now_ms);
+        }
         // 链路没了,已发的低延迟请求也随之失效,下次连上要重新发。
         self.low_latency_sent.remove(mac);
     }
@@ -365,19 +382,19 @@ impl Engine {
     /// 按当前状态重新给出扫描指令。
     ///
     /// 用在两个时机:权限刚批下来(此前的开扫必然失败),以及扫描被系统掐掉后重开。
-    pub fn scan_command(&mut self) -> Scan {
-        self.commit_scan()
+    pub fn scan_command(&mut self, now_ms: u64) -> Scan {
+        self.commit_scan_at(now_ms)
     }
 
     /// 目标扫描状态与上次下发的不同时才返回。
     ///
     /// 每个事件都重下指令的话,安卓侧会不停地停扫再开扫,那本身就是一次射频扰动。
-    pub fn scan_if_changed(&mut self) -> Option<Scan> {
-        let want = self.desired_scan();
+    pub fn scan_if_changed(&mut self, now_ms: u64) -> Option<Scan> {
+        let want = self.desired_scan(now_ms);
         if self.last_scan.as_ref() == Some(&want) {
             return None;
         }
-        Some(self.commit_scan())
+        Some(self.commit_scan_at(now_ms))
     }
 
     /// 只盯还没连上的布防设备。
@@ -385,7 +402,7 @@ impl Engine {
     /// 已经连上的不能再扫:BLE 扫描与已建立的连接共用同一个射频,扫描窗口会挤掉
     /// 手柄的输入包 —— 轻则极短操作卡手,重则连续丢包触发 0x08 监督超时断线。
     /// 实测账单显示应用曾在手柄连着时累计扫了两个多小时。
-    fn desired_scan(&self) -> Scan {
+    fn desired_scan(&self, now_ms: u64) -> Scan {
         let mut waiting: Vec<String> = self
             .armed
             .iter()
@@ -395,13 +412,21 @@ impl Engine {
         if waiting.is_empty() {
             return Scan::Stop;
         }
+        // 只要还有一台是「刚失去连接不久」,就值得用满占空比把它抢回来。
+        let fast = waiting.iter().any(|mac| {
+            self.waiting_since
+                .get(mac)
+                .is_some_and(|since| {
+                    now_ms.saturating_sub(*since) < FAST_SCAN_MS
+                })
+        });
         // 顺序稳定,测试与去重都依赖它。
         waiting.sort();
-        Scan::Start(waiting)
+        Scan::Start { macs: waiting, fast }
     }
 
-    fn commit_scan(&mut self) -> Scan {
-        let want = self.desired_scan();
+    fn commit_scan_at(&mut self, now_ms: u64) -> Scan {
+        let want = self.desired_scan(now_ms);
         self.last_scan = Some(want.clone());
         want
     }
@@ -558,12 +583,12 @@ mod tests {
         let mut e = Engine::new();
         assert_eq!(
             e.toggle(PAD, 0),
-            Scan::Start(vec![PAD.into()])
+            Scan::Start { macs: vec![PAD.into()], fast: true }
         );
         // 第二台加入后要带着两个地址重开扫描,否则新设备不在过滤器里。
         let two = e.toggle(MOUSE, 0);
         match two {
-            Scan::Start(mut macs) => {
+            Scan::Start { mut macs, .. } => {
                 macs.sort();
                 let mut want = vec![
                     PAD.to_string(),
@@ -584,7 +609,7 @@ mod tests {
         let mut e = Engine::new();
         assert_eq!(
             e.restore(vec![PAD.into()], 0),
-            Scan::Start(vec![PAD.into()])
+            Scan::Start { macs: vec![PAD.into()], fast: true }
         );
         assert!(e.row(PAD).armed);
         assert_eq!(e.armed_macs(), vec![PAD.to_string()]);
@@ -599,11 +624,11 @@ mod tests {
         // 权限刚批下来时要能按当前名单重开扫描 —— 在那之前的开扫必然失败,
         // 不重来的话界面显示"等待广播"而扫描根本没起来。
         let mut e = Engine::new();
-        assert_eq!(e.scan_command(), Scan::Stop);
+        assert_eq!(e.scan_command(0), Scan::Stop);
         e.toggle(PAD, 0);
         assert_eq!(
-            e.scan_command(),
-            Scan::Start(vec![PAD.into()])
+            e.scan_command(0),
+            Scan::Start { macs: vec![PAD.into()], fast: true }
         );
     }
 
@@ -678,6 +703,34 @@ mod tests {
     }
 
     #[test]
+    fn scanning_runs_at_full_duty_right_after_a_drop() {
+        // 省电扫描每 5120 毫秒只听 512 毫秒,九成时间听不见 —— 刚掉线那阵子
+        // 人多半还在用,这几秒的等待要靠满占空比压掉。
+        let mut e = armed_engine();
+        e.on_connection_change(PAD, true, 1_000);
+        e.scan_if_changed(1_000);
+        e.on_connection_change(PAD, false, 2_000);
+        assert_eq!(
+            e.scan_if_changed(2_000),
+            Some(Scan::Start { macs: vec![PAD.into()], fast: true })
+        );
+    }
+
+    #[test]
+    fn scanning_falls_back_to_low_power_once_the_device_stays_away() {
+        // 过了这段还没回来,手柄多半已经关机,再全速扫只是把电白白烧掉。
+        let mut e = armed_engine();
+        e.on_connection_change(PAD, true, 1_000);
+        e.scan_if_changed(1_000);
+        e.on_connection_change(PAD, false, 2_000);
+        e.scan_if_changed(2_000);
+        assert_eq!(
+            e.scan_if_changed(2_000 + FAST_SCAN_MS),
+            Some(Scan::Start { macs: vec![PAD.into()], fast: false })
+        );
+    }
+
+    #[test]
     fn keepalive_is_paced_and_only_sent_while_connected() {
         // 保活是发给「连着的手柄」的:没连上时发无处可发。节奏也要限住,
         // 每分钟一次足够试探固件,再密只是白耗电。
@@ -709,11 +762,11 @@ mod tests {
         // 也是 0x08 监督超时的已知诱因。
         let mut e = armed_engine();
         e.on_connection_change(PAD, true, 1_000);
-        assert_eq!(e.scan_if_changed(), Some(Scan::Stop));
+        assert_eq!(e.scan_if_changed(0), Some(Scan::Stop));
 
         e.on_tick(PAD, false, 11_000);
         assert_eq!(
-            e.scan_if_changed(),
+            e.scan_if_changed(0),
             None,
             "空窗期内不该重开扫描"
         );
@@ -725,12 +778,12 @@ mod tests {
         // 当场判断说了算,否则又回到「扫描永不恢复」。
         let mut e = armed_engine();
         e.on_connection_change(PAD, true, 1_000);
-        e.scan_if_changed();
+        e.scan_if_changed(0);
 
         e.on_tick(PAD, false, 1_000 + SETTLE_MS + 1);
         assert_eq!(
-            e.scan_if_changed(),
-            Some(Scan::Start(vec![PAD.into()]))
+            e.scan_if_changed(0),
+            Some(Scan::Start { macs: vec![PAD.into()], fast: true })
         );
     }
 
@@ -743,12 +796,12 @@ mod tests {
         // 五分钟一次的盲试兜底,手柄回来后要等很久才被接上。
         let mut e = armed_engine();
         e.on_connection_change(PAD, true, 1_000);
-        assert_eq!(e.scan_if_changed(), Some(Scan::Stop));
+        assert_eq!(e.scan_if_changed(0), Some(Scan::Stop));
 
         e.on_tick(PAD, false, 40_000);
         assert_eq!(
-            e.scan_if_changed(),
-            Some(Scan::Start(vec![PAD.into()]))
+            e.scan_if_changed(0),
+            Some(Scan::Start { macs: vec![PAD.into()], fast: true })
         );
     }
 
@@ -757,7 +810,7 @@ mod tests {
         // 广播路径同理:收到广播且平台说没连,那就是没连。
         let mut e = armed_engine();
         e.on_connection_change(PAD, true, 1_000);
-        e.scan_if_changed();
+        e.scan_if_changed(0);
         e.on_advertisement(PAD, false, 40_000);
         assert_eq!(e.row(PAD).state, "正在连接");
     }
@@ -769,7 +822,7 @@ mod tests {
         // 手柄连着时累计扫了两个多小时。
         let mut e = armed_engine();
         e.on_connection_change(PAD, true, 1_000);
-        assert_eq!(e.scan_if_changed(), Some(Scan::Stop));
+        assert_eq!(e.scan_if_changed(0), Some(Scan::Stop));
     }
 
     #[test]
@@ -777,11 +830,11 @@ mod tests {
         // 断开后必须立刻恢复盯广播,否则手柄回来时没人看见。
         let mut e = armed_engine();
         e.on_connection_change(PAD, true, 1_000);
-        e.scan_if_changed();
+        e.scan_if_changed(0);
         e.on_connection_change(PAD, false, 2_000);
         assert_eq!(
-            e.scan_if_changed(),
-            Some(Scan::Start(vec![PAD.into()]))
+            e.scan_if_changed(0),
+            Some(Scan::Start { macs: vec![PAD.into()], fast: true })
         );
     }
 
@@ -791,8 +844,8 @@ mod tests {
         // 每个事件都重下扫描指令的话,安卓侧会不停地停扫再开扫,
         // 那本身就是一次射频扰动。只在目标集合变化时下发。
         let mut e = armed_engine();
-        e.scan_if_changed();
-        assert_eq!(e.scan_if_changed(), None);
+        e.scan_if_changed(0);
+        assert_eq!(e.scan_if_changed(0), None);
     }
 
     #[test]
@@ -802,8 +855,8 @@ mod tests {
         e.toggle(MOUSE, 0);
         e.on_connection_change(PAD, true, 1_000);
         assert_eq!(
-            e.scan_if_changed(),
-            Some(Scan::Start(vec![MOUSE.into()]))
+            e.scan_if_changed(0),
+            Some(Scan::Start { macs: vec![MOUSE.into()], fast: true })
         );
     }
 

@@ -299,7 +299,7 @@ fn claim_low_latency(mac: &str) {
 /// 目标扫描状态变了才下发。每个事件都重下的话,安卓侧会不停停扫再开扫,
 /// 那本身就是一次射频扰动。
 fn update_scan() {
-    if let Some(cmd) = with_engine(|e| e.scan_if_changed())
+    if let Some(cmd) = with_engine(|e| e.scan_if_changed(now_ms()))
     {
         apply(cmd);
     }
@@ -308,10 +308,30 @@ fn update_scan() {
 /// 把引擎的扫描指令交给 Java 执行。
 fn apply(cmd: Scan) {
     match cmd {
-        Scan::Start(macs) => {
-            call_with_str!("startScan", macs.join("\n"))
+        Scan::Start { macs, fast } => {
+            call_scan(&macs.join("\n"), fast)
         }
         Scan::Stop => call_void!("stopScan"),
+    }
+}
+
+/// 开扫。`fast` 决定占空比:刚掉线要抢时间,久等不回就省电。
+fn call_scan(mac_list: &str, fast: bool) {
+    let done: jni::errors::Result<()> = vm()
+        .attach_current_thread(|env| {
+            let s = env.new_string(mac_list)?;
+            env.call_static_method(
+                jni::jni_str!(
+                    "io/github/yebei199/btrearm/Rearm"
+                ),
+                jni::jni_str!("startScan"),
+                jni::jni_sig!("(Ljava/lang/String;Z)V"),
+                &[(&s).into(), fast.into()],
+            )?;
+            Ok(())
+        });
+    if let Err(err) = done {
+        log::warn!("startScan 调用失败: {err}");
     }
 }
 
@@ -368,7 +388,7 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeResumeScan<
     _class: jni::objects::JClass<'c>,
 ) {
     env.with_env(|_env| -> jni::errors::Result<()> {
-        let cmd = with_engine(|e| e.scan_command());
+        let cmd = with_engine(|e| e.scan_command(now_ms()));
         apply(cmd);
         Ok(())
     })

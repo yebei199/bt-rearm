@@ -184,7 +184,7 @@ public final class Rearm {
      * @param macList 换行分隔的 MAC 列表。用字符串而不是 String[]:JNI 造数组要
      *     多一圈 API,而这里的量小到不值得。
      */
-    public static synchronized void startScan(String macList) {
+    public static synchronized void startScan(String macList, boolean fast) {
         String[] macs = macList.isEmpty() ? new String[0] : macList.split("\n");
         BluetoothLeScanner scanner = scanner();
         if (scanner == null) {
@@ -205,9 +205,13 @@ public final class Rearm {
             // 是不是布防目标,由 Rust 引擎按名单判断。
             filters.add(new ScanFilter.Builder()
                     .setServiceUuid(new ParcelUuid(HID_SERVICE)).build());
-            // LOW_POWER 已足够:手柄开机后会持续广播好几分钟。
+            // 省电模式每 5120 毫秒只听 512 毫秒,九成时间耳朵是闭着的 —— 手柄
+            // 广播得再勤,平均也要两秒多才被撞上。刚掉线那阵子改用满占空比把
+            // 这段等待压掉;久等不回(手柄多半已关机)再退回省电,免得白烧电。
             ScanSettings settings = new ScanSettings.Builder()
-                    .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
+                    .setScanMode(fast
+                            ? ScanSettings.SCAN_MODE_LOW_LATENCY
+                            : ScanSettings.SCAN_MODE_LOW_POWER)
                     .build();
             scanner.startScan(filters, settings, SCAN);
             scanning = true;
