@@ -106,9 +106,9 @@ impl Engine {
         if !self.armed.contains(mac) {
             return Action::Skip("未布防");
         }
+        self.sync_connected(mac, system_connected);
         if system_connected {
             // 系统自己连上了就让路 —— 这正是布防该袖手的时候。
-            self.connected.insert(mac.to_string());
             self.note(now_ms, format!("{mac} 系统已连接,让路"));
             return Action::Skip("系统已连接");
         }
@@ -135,8 +135,8 @@ impl Engine {
         if !self.armed.contains(mac) {
             return Action::Skip("未布防");
         }
+        self.sync_connected(mac, system_connected);
         if system_connected {
-            self.connected.insert(mac.to_string());
             self.blind_gap.remove(mac);
             self.note(now_ms, format!("{mac} 系统已连接,让路"));
             return Action::Skip("系统已连接");
@@ -152,6 +152,20 @@ impl Engine {
             .insert(mac.to_string(), (gap * 2).min(BLIND_GAP_MAX_MS));
         self.note(now_ms, format!("{mac} 盲试连接"));
         Action::Connect
+    }
+
+    /// 用平台报来的权威状态校正本地记录。
+    ///
+    /// 只靠 ACL 广播维护连接状态是不够的:进程被冻结、被杀后重启、广播风暴时
+    /// 都可能漏掉断开那一条,「已连接」便会永久残留 —— 而扫描按它决定开停,
+    /// 于是扫描再也不会恢复,只剩已退避到五分钟一次的盲试兜底。广播路径与盲试
+    /// 路径每次都带着平台的当场判断,拿它兜底即可。
+    fn sync_connected(&mut self, mac: &str, system_connected: bool) {
+        if system_connected {
+            self.connected.insert(mac.to_string());
+        } else {
+            self.connected.remove(mac);
+        }
     }
 
     /// 连接状态变了(我们连上的,或链路断了)。
@@ -467,6 +481,33 @@ mod tests {
         assert_eq!(e.log(0).len(), LOG_CAP);
         // 保留的是最近的,最早那条应被挤掉。
         assert!(e.log(0).iter().all(|l| !l.ends_with("第 0 条")));
+    }
+
+    #[test]
+    fn tick_clears_a_stale_connected_flag_and_scanning_resumes() {
+        // 断开广播可能丢失:进程被冻结、被杀后重启、广播风暴时都会漏。
+        // on_tick 每次都从平台拿到权威的连接状态,必须用它把残留的「已连接」
+        // 清掉 —— 否则引擎永远认为设备连着,扫描再也不会恢复,只剩已退避到
+        // 五分钟一次的盲试兜底,手柄回来后要等很久才被接上。
+        let mut e = armed_engine();
+        e.on_connection_change(PAD, true, 1_000);
+        assert_eq!(e.scan_if_changed(), Some(Scan::Stop));
+
+        e.on_tick(PAD, false, 20_000);
+        assert_eq!(
+            e.scan_if_changed(),
+            Some(Scan::Start(vec![PAD.into()]))
+        );
+    }
+
+    #[test]
+    fn advertisement_clears_a_stale_connected_flag() {
+        // 广播路径同理:收到广播且平台说没连,那就是没连。
+        let mut e = armed_engine();
+        e.on_connection_change(PAD, true, 1_000);
+        e.scan_if_changed();
+        e.on_advertisement(PAD, false, 20_000);
+        assert_eq!(e.row(PAD).state, "正在连接");
     }
 
     #[test]
