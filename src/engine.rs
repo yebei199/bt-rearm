@@ -336,35 +336,20 @@ impl Engine {
     /// 判断留在这里而不是安卓那侧,是因为「什么算需要人管」是策略。安卓只负责
     /// 把两个它才知道的事实(蓝牙开没开、特权身份就绪没有)递进来,再把返回的
     /// 话显示出去。返回 None 表示一切正常,通知该撤掉。
+    ///
+    /// 无论哪种原因,都要先等到有设备久等不回才开口。少了这道闸,应用每次启动
+    /// 都会在 Shizuku 绑定完成前的那一瞬间弹一次「未就绪」,弹完自己撤掉 ——
+    /// 通知栏一闪而过的假警报比不提醒更让人不信任它。
     pub fn attention(
         &self,
         bt_on: bool,
         privileged_ready: bool,
         now_ms: u64,
     ) -> Option<String> {
-        // 一台都没布防说明用户没在用这个工具,那就什么都别说。
-        let waiting: Vec<&String> = self
+        let mut stale: Vec<&str> = self
             .armed
             .iter()
             .filter(|m| !self.connected.contains(*m))
-            .collect();
-        if self.armed.is_empty() {
-            return None;
-        }
-        if !bt_on {
-            return Some(
-                "蓝牙已关闭,布防中的设备无法回连".into(),
-            );
-        }
-        if !privileged_ready {
-            return Some(
-                "Shizuku 未就绪,回连会退回到成功率很低的普通方式"
-                    .into(),
-            );
-        }
-        // 等待起点缺失的设备(比如刚布防就连上过)不该被算成久等。
-        let mut stale: Vec<&str> = waiting
-            .into_iter()
             .filter(|m| {
                 self.waiting_since.get(*m).is_some_and(
                     |since| {
@@ -377,6 +362,19 @@ impl Engine {
             .collect();
         if stale.is_empty() {
             return None;
+        }
+        // 先说蓝牙:开了蓝牙才轮得到特权身份起作用,而特权身份到位了,
+        // 剩下唯一说得通的解释就是设备自己不在。
+        if !bt_on {
+            return Some(
+                "蓝牙已关闭,布防中的设备无法回连".into(),
+            );
+        }
+        if !privileged_ready {
+            return Some(
+                "Shizuku 未就绪,回连会退回到成功率很低的普通方式"
+                    .into(),
+            );
         }
         stale.sort();
         Some(format!(
@@ -1139,7 +1137,7 @@ mod tests {
         // 蓝牙关了谁也救不回来,只能让用户去开。
         let e = armed_engine();
         let msg = e
-            .attention(false, true, 1_000)
+            .attention(false, true, ATTENTION_MS)
             .expect("该提醒开蓝牙");
         assert!(msg.contains("蓝牙"), "{msg}");
     }
@@ -1149,7 +1147,7 @@ mod tests {
         // 没有特权身份就退回到普通连接,回连成功率大跌,值得让用户去启动 Shizuku。
         let e = armed_engine();
         let msg = e
-            .attention(true, false, 1_000)
+            .attention(true, false, ATTENTION_MS)
             .expect("该提醒 Shizuku");
         assert!(msg.contains("Shizuku"), "{msg}");
     }
@@ -1158,7 +1156,9 @@ mod tests {
     fn attention_prefers_bluetooth_over_shizuku() {
         // 两个都不满足时先说蓝牙:开了蓝牙才轮得到特权身份起作用。
         let e = armed_engine();
-        let msg = e.attention(false, false, 1_000).unwrap();
+        let msg = e
+            .attention(false, false, ATTENTION_MS)
+            .unwrap();
         assert!(msg.contains("蓝牙"), "{msg}");
     }
 
@@ -1203,6 +1203,15 @@ mod tests {
         assert!(e.attention(true, true, late).is_some());
         e.on_connection_change(PAD, true, late);
         assert_eq!(e.attention(true, true, late), None);
+    }
+
+    #[test]
+    fn attention_holds_fire_while_shizuku_is_still_binding()
+    {
+        // 应用刚启动时 Shizuku 还在绑定,这一瞬间不该弹「未就绪」再自己撤掉 ——
+        // 一闪而过的假警报比不提醒更让人不信任它。
+        let e = armed_engine();
+        assert_eq!(e.attention(true, false, 1_000), None);
     }
 
     #[test]
