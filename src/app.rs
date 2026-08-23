@@ -272,6 +272,14 @@ fn with_engine<T>(f: impl FnOnce(&mut Engine) -> T) -> T {
     f(engine)
 }
 
+/// 目标扫描状态变了才下发。每个事件都重下的话,安卓侧会不停停扫再开扫,
+/// 那本身就是一次射频扰动。
+fn update_scan() {
+    if let Some(cmd) = with_engine(|e| e.scan_if_changed()) {
+        apply(cmd);
+    }
+}
+
 /// 把引擎的扫描指令交给 Java 执行。
 fn apply(cmd: Scan) {
     match cmd {
@@ -353,6 +361,7 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeTick<'c>(
             if action == Action::Connect {
                 call_connect(&mac);
             }
+            update_scan();
         }
         Ok(())
     })
@@ -379,6 +388,7 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnAdvertiseme
         if action == Action::Connect {
             call_connect(&mac);
         }
+        update_scan();
         Ok(())
     })
     .resolve::<jni::errors::LogErrorAndDefault>()
@@ -395,6 +405,9 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnConnectionC
     env.with_env(|env| -> jni::errors::Result<()> {
         let mac = mac.try_to_string(env)?;
         with_engine(|e| e.on_connection_change(&mac, connected, now_ms()));
+        // 连上就停扫、断开就复扫。扫描与已建立的连接共用射频,连着还扫会挤掉
+        // 手柄的输入包 —— 卡手与 0x08 监督超时断线都由此而来。
+        update_scan();
         Ok(())
     })
     .resolve::<jni::errors::LogErrorAndDefault>()

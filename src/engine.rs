@@ -28,8 +28,8 @@ pub enum Action {
     Skip(&'static str),
 }
 
-/// 布防名单变化后,扫描该怎么走。
-#[derive(Debug, PartialEq, Eq)]
+/// 扫描该怎么走。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scan {
     /// 按这批地址开扫(名单变化时也用它,等价于换过滤器重开)。
     Start(Vec<String>),
@@ -62,6 +62,8 @@ pub struct Engine {
     connected: HashSet<String>,
     /// 每台设备当前的盲试间隔。收到广播或连上即回到起始值。
     blind_gap: HashMap<String, u64>,
+    /// 上一次下发给安卓侧的扫描指令,用来避免重复下发。
+    last_scan: Option<Scan>,
     log: Vec<Entry>,
 }
 
@@ -82,7 +84,7 @@ impl Engine {
             self.armed.insert(mac.to_string());
             self.note(now_ms, format!("{mac} 布防"));
         }
-        self.scan_cmd()
+        self.commit_scan()
     }
 
     /// 进程重启后,从存盘名单恢复布防。
@@ -91,7 +93,7 @@ impl Engine {
             self.armed.insert(mac);
         }
         self.note(now_ms, format!("恢复布防 {} 台", self.armed.len()));
-        self.scan_cmd()
+        self.commit_scan()
     }
 
     /// 扫到一条广播。`system_connected` 是安卓侧当场查到的连接状态。
@@ -223,20 +225,48 @@ impl Engine {
         self.note(now_ms, line);
     }
 
-    /// 按当前名单重新给出扫描指令。
+    /// 按当前状态重新给出扫描指令。
     ///
     /// 用在两个时机:权限刚批下来(此前的开扫必然失败),以及扫描被系统掐掉后重开。
-    pub fn scan_command(&self) -> Scan {
-        self.scan_cmd()
+    pub fn scan_command(&mut self) -> Scan {
+        self.commit_scan()
     }
 
-    /// 布防名单非空才扫描,空了必须停 —— 扫描是这里唯一的耗电项。
-    fn scan_cmd(&self) -> Scan {
-        if self.armed.is_empty() {
-            Scan::Stop
-        } else {
-            Scan::Start(self.armed_macs())
+    /// 目标扫描状态与上次下发的不同时才返回。
+    ///
+    /// 每个事件都重下指令的话,安卓侧会不停地停扫再开扫,那本身就是一次射频扰动。
+    pub fn scan_if_changed(&mut self) -> Option<Scan> {
+        let want = self.desired_scan();
+        if self.last_scan.as_ref() == Some(&want) {
+            return None;
         }
+        Some(self.commit_scan())
+    }
+
+    /// 只盯还没连上的布防设备。
+    ///
+    /// 已经连上的不能再扫:BLE 扫描与已建立的连接共用同一个射频,扫描窗口会挤掉
+    /// 手柄的输入包 —— 轻则极短操作卡手,重则连续丢包触发 0x08 监督超时断线。
+    /// 实测账单显示应用曾在手柄连着时累计扫了两个多小时。
+    fn desired_scan(&self) -> Scan {
+        let mut waiting: Vec<String> = self
+            .armed
+            .iter()
+            .filter(|mac| !self.connected.contains(*mac))
+            .cloned()
+            .collect();
+        if waiting.is_empty() {
+            return Scan::Stop;
+        }
+        // 顺序稳定,测试与去重都依赖它。
+        waiting.sort();
+        Scan::Start(waiting)
+    }
+
+    fn commit_scan(&mut self) -> Scan {
+        let want = self.desired_scan();
+        self.last_scan = Some(want.clone());
+        want
     }
 
     /// 记一条日志。连续重复的合并成一条并计次。
@@ -437,6 +467,50 @@ mod tests {
         assert_eq!(e.log(0).len(), LOG_CAP);
         // 保留的是最近的,最早那条应被挤掉。
         assert!(e.log(0).iter().all(|l| !l.ends_with("第 0 条")));
+    }
+
+    #[test]
+    fn scan_stops_once_the_armed_device_is_connected() {
+        // 连上之后还扫它,是拿同一个射频跟自己抢:扫描窗口会挤掉手柄的输入包,
+        // 轻则极短操作卡手,重则连续丢包触发监督超时断线。实测账单显示应用在
+        // 手柄连着时累计扫了两个多小时。
+        let mut e = armed_engine();
+        e.on_connection_change(PAD, true, 1_000);
+        assert_eq!(e.scan_if_changed(), Some(Scan::Stop));
+    }
+
+    #[test]
+    fn scan_resumes_when_the_connection_drops() {
+        // 断开后必须立刻恢复盯广播,否则手柄回来时没人看见。
+        let mut e = armed_engine();
+        e.on_connection_change(PAD, true, 1_000);
+        e.scan_if_changed();
+        e.on_connection_change(PAD, false, 2_000);
+        assert_eq!(
+            e.scan_if_changed(),
+            Some(Scan::Start(vec![PAD.into()]))
+        );
+    }
+
+    #[test]
+    fn scan_is_not_reissued_while_the_target_set_is_unchanged() {
+        // 每个事件都重下扫描指令的话,安卓侧会不停地停扫再开扫,
+        // 那本身就是一次射频扰动。只在目标集合变化时下发。
+        let mut e = armed_engine();
+        e.scan_if_changed();
+        assert_eq!(e.scan_if_changed(), None);
+    }
+
+    #[test]
+    fn scan_covers_only_the_devices_still_waiting() {
+        // 两台布防、一台已连上时,扫描过滤器里只该留还没连上的那台。
+        let mut e = armed_engine();
+        e.toggle(MOUSE, 0);
+        e.on_connection_change(PAD, true, 1_000);
+        assert_eq!(
+            e.scan_if_changed(),
+            Some(Scan::Start(vec![MOUSE.into()]))
+        );
     }
 
     #[test]
