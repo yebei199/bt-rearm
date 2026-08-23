@@ -27,6 +27,13 @@ pub const BLIND_GAP_MAX_MS: u64 = 300_000;
 /// 盲试退避的上限,窗口外仍由平台的当场判断兜底,免得回到「扫描永不恢复」。
 pub const SETTLE_MS: u64 = 30_000;
 
+/// 两次保活之间的间隔。
+///
+/// 手柄闲置一段时间会自行休眠,那是它固件里的计时器,平板改不了。能试的只有
+/// 一件事:往手柄发点数据,看它的固件认不认这算「有活动」。认不认查不到资料,
+/// 只能实测,所以这是个实验而非确定的修复。一分钟一次足够试探,再密只是白耗电。
+pub const KEEPALIVE_GAP_MS: u64 = 60_000;
+
 /// 收到一条广播后,决定要不要动手。
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
@@ -74,6 +81,8 @@ pub struct Engine {
     last_scan: Option<Scan>,
     /// 各设备 ACL 链路建立的时刻,用于判断是否还在稳定窗口内。
     acl_since: HashMap<String, u64>,
+    /// 各设备上次发保活的时刻。
+    last_keepalive: HashMap<String, u64>,
     /// 本次链路已经发过低延迟请求的设备。断开即清。
     low_latency_sent: HashSet<String>,
     log: Vec<Entry>,
@@ -212,6 +221,26 @@ impl Engine {
             return false;
         }
         self.low_latency_sent.insert(mac.to_string())
+    }
+
+    /// 领取一次保活许可。到点且设备连着才给。
+    ///
+    /// 保活是往手柄发一点数据,试探它的固件认不认这算「有活动」,从而推迟自行
+    /// 休眠。认不认取决于固件,查不到资料,只能实测 —— 所以这是实验性的。
+    /// 没连上时无处可发;没布防的设备不归我们管,别去打扰它的链路。
+    pub fn take_keepalive(&mut self, mac: &str, now_ms: u64) -> bool {
+        if !(self.armed.contains(mac)
+            && self.connected.contains(mac))
+        {
+            return false;
+        }
+        if let Some(last) = self.last_keepalive.get(mac)
+            && now_ms.saturating_sub(*last) < KEEPALIVE_GAP_MS
+        {
+            return false;
+        }
+        self.last_keepalive.insert(mac.to_string(), now_ms);
+        true
     }
 
     /// 用平台报来的权威状态校正本地记录。
@@ -646,6 +675,30 @@ mod tests {
         let mut e = armed_engine();
         e.on_connection_change(MOUSE, true, 1_000);
         assert!(!e.take_low_latency_request(MOUSE));
+    }
+
+    #[test]
+    fn keepalive_is_paced_and_only_sent_while_connected() {
+        // 保活是发给「连着的手柄」的:没连上时发无处可发。节奏也要限住,
+        // 每分钟一次足够试探固件,再密只是白耗电。
+        let mut e = armed_engine();
+        assert!(!e.take_keepalive(PAD, 0), "没连上时不该发");
+
+        e.on_connection_change(PAD, true, 1_000);
+        assert!(e.take_keepalive(PAD, 1_000));
+        assert!(
+            !e.take_keepalive(PAD, 1_000 + KEEPALIVE_GAP_MS - 1),
+            "未到间隔不该重发"
+        );
+        assert!(e.take_keepalive(PAD, 1_000 + KEEPALIVE_GAP_MS));
+    }
+
+    #[test]
+    fn keepalive_is_not_sent_to_unarmed_devices() {
+        // 没布防的设备不归我们管,别去打扰它的链路。
+        let mut e = armed_engine();
+        e.on_connection_change(MOUSE, true, 1_000);
+        assert!(!e.take_keepalive(MOUSE, 1_000));
     }
 
     #[test]

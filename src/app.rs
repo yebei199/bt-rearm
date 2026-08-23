@@ -401,6 +401,10 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeTick<
             update_scan();
             // 应用启动时设备可能已经连着,那一刻不会再有连接广播 —— 巡检补发。
             claim_low_latency(&mac);
+            // 保活:试探手柄固件认不认平板发来的数据算「有活动」,从而推迟休眠。
+            if with_engine(|e| e.take_keepalive(&mac, now)) {
+                call_with_str!("keepAlive", &mac);
+            }
         }
         Ok(())
     })

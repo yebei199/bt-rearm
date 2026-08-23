@@ -4,6 +4,8 @@ import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGatt;
 import android.bluetooth.BluetoothGattCallback;
+import android.bluetooth.BluetoothGattCharacteristic;
+import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothManager;
 import android.bluetooth.BluetoothProfile;
 import android.bluetooth.le.BluetoothLeScanner;
@@ -59,6 +61,9 @@ public final class Rearm {
     private static Context ctx;
     /** 当前挂着的 GATT 客户端,按 MAC 存,断开时释放。 */
     private static final Map<String, BluetoothGatt> gatts = new HashMap<>();
+    /** 每台设备用于保活的可读特征,服务发现完成后确定。 */
+    private static final Map<String, BluetoothGattCharacteristic> keepaliveTarget =
+            new HashMap<>();
     private static boolean scanning;
     private static boolean ticking;
     /**
@@ -99,10 +104,44 @@ public final class Rearm {
             if (newState != BluetoothProfile.STATE_CONNECTED) {
                 synchronized (Rearm.class) {
                     closeQuietly(gatts.remove(mac));
+                    keepaliveTarget.remove(mac);
                 }
                 return;
             }
             applyHighPriority(mac, g);
+            // 保活要往手柄发真实的空中数据,得先知道有哪些特征可读。
+            try {
+                g.discoverServices();
+            } catch (SecurityException e) {
+                nativeOnError("服务发现失败: " + e);
+            }
+        }
+
+        @Override
+        public void onServicesDiscovered(BluetoothGatt g, int status) {
+            if (status != BluetoothGatt.GATT_SUCCESS) return;
+            String mac = g.getDevice().getAddress();
+            BluetoothGattCharacteristic pick = pickReadable(g);
+            if (pick == null) {
+                nativeOnError("没有可用于保活的特征 " + mac);
+                return;
+            }
+            synchronized (Rearm.class) {
+                keepaliveTarget.put(mac, pick);
+            }
+        }
+
+        @Override
+        public void onCharacteristicRead(
+                BluetoothGatt g,
+                BluetoothGattCharacteristic c,
+                byte[] value,
+                int status) {
+            // 读成功即说明数据确实到手柄走了一圈,这正是保活想要的效果。
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                nativeOnError("保活读取失败 " + g.getDevice().getAddress()
+                        + " 状态 " + status);
+            }
         }
 
     };
@@ -273,6 +312,46 @@ public final class Rearm {
             }
         } catch (SecurityException e) {
             nativeOnError("请求低延迟失败: " + e);
+        }
+    }
+
+    /**
+     * 挑一个可读、且不属于 HID 服务的特征作为保活目标。
+     *
+     * <p>避开 HID 服务(0x1812):安卓禁止普通应用访问它,读会抛 SecurityException。
+     * 设备信息服务里的型号、固件版本之类是只读常量,读它对手柄没有副作用。
+     */
+    private static BluetoothGattCharacteristic pickReadable(BluetoothGatt g) {
+        for (BluetoothGattService svc : g.getServices()) {
+            if (HID_SERVICE.equals(svc.getUuid())) continue;
+            for (BluetoothGattCharacteristic c : svc.getCharacteristics()) {
+                if ((c.getProperties() & BluetoothGattCharacteristic.PROPERTY_READ) != 0) {
+                    return c;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 往手柄发一次保活:读一个无副作用的特征。
+     *
+     * <p>手柄闲置会自行休眠,那是它固件里的计时器,平板改不了。唯一能试的是往它
+     * 发点数据,看固件认不认这算「有活动」—— 认不认查不到资料,只能实测,所以这
+     * 是实验性的。要不要发、多久发一次,由 Rust 引擎决定。
+     */
+    public static void keepAlive(String mac) {
+        BluetoothGatt g;
+        BluetoothGattCharacteristic target;
+        synchronized (Rearm.class) {
+            g = gatts.get(mac);
+            target = keepaliveTarget.get(mac);
+        }
+        if (g == null || target == null) return;
+        try {
+            g.readCharacteristic(target);
+        } catch (SecurityException e) {
+            nativeOnError("保活失败: " + e);
         }
     }
 
