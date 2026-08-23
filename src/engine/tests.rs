@@ -785,18 +785,14 @@ fn one_device_being_connected_does_not_blind_the_others() {
 }
 
 #[test]
-fn keepalive_is_currently_switched_off() {
-    // 保活的收益从未验证,而它刚开始真正发出去,掉线就密了起来 —— 相关性不等于
-    // 因果,但它往手柄输入所用的同一条链路上定期塞数据,先关掉做对照。
-    // 这个用例是那个决定的留痕:哪天把开关拨回去,它会立刻提醒你改了什么。
+fn keepalive_goes_out_when_the_switch_is_on() {
+    // 总开关与内层规则分开:开关一关,针对 take_keepalive 的用例就会全部变成
+    // 空转,节奏和适用范围哪天被改坏都看不出来。这个用例盯着两者的接合处。
     let mut e = armed_engine();
     e.on_connection_change(PAD, true, 1_000);
-    assert!(
-        e.keepalive_due(PAD, 1_000),
-        "内层规则本身仍然成立"
-    );
-    assert!(
-        !e.take_keepalive(PAD, 60_000),
-        "但总开关关着,对外一律不发"
+    assert_eq!(
+        e.take_keepalive(PAD, 1_000),
+        KEEPALIVE_ENABLED,
+        "对外发不发,只取决于总开关"
     );
 }
