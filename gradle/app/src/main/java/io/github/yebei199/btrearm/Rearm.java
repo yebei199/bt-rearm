@@ -137,10 +137,10 @@ public final class Rearm {
             for (BluetoothGattService svc : g.getServices()) {
                 found.append(' ').append(svc.getUuid().toString(), 4, 8);
             }
-            nativeOnError(found.toString());
+            log(found.toString());
             BluetoothGattCharacteristic pick = pickReadable(g);
             if (pick == null) {
-                nativeOnError("没有可用于保活的特征 " + mac);
+                log("没有可用于保活的特征 " + mac);
                 return;
             }
             synchronized (Rearm.class) {
@@ -595,6 +595,17 @@ public final class Rearm {
     private static native void nativeOnConnectionChange(String mac, boolean connected);
 
     private static native void nativeOnError(String message);
+
+    /**
+     * 往应用内日志写一行,同时抄一份进 logcat。
+     *
+     * <p>抄这一份是因为这台红魔把 log.tag 设成了 SILENT,平时 logcat 什么都看不到;
+     * 而想看应用内那份日志就得把界面切到前台 —— 用户正在打游戏时这么做是不礼貌的。
+     */
+    private static void log(String line) {
+        android.util.Log.i("btrearm", line);
+        nativeOnError(line);
+    }
 
     private static final ScanCallback SCAN = new ScanCallback() {
         @Override
