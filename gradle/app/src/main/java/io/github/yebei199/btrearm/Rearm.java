@@ -133,6 +133,11 @@ public final class Rearm {
         public void onServicesDiscovered(BluetoothGatt g, int status) {
             if (status != BluetoothGatt.GATT_SUCCESS) return;
             String mac = g.getDevice().getAddress();
+            StringBuilder found = new StringBuilder("服务:");
+            for (BluetoothGattService svc : g.getServices()) {
+                found.append(' ').append(svc.getUuid().toString(), 4, 8);
+            }
+            nativeOnError(found.toString());
             BluetoothGattCharacteristic pick = pickReadable(g);
             if (pick == null) {
                 nativeOnError("没有可用于保活的特征 " + mac);
@@ -267,6 +272,9 @@ public final class Rearm {
         String privileged = Privileged.connect(mac);
         if (privileged != null) {
             nativeOnError(privileged);
+            // 系统接管了链路,但保活和读电量用的是我们自己的 GATT 客户端 ——
+            // 以前这里直接返回,那两件事便一直在空转。
+            ensureGatt(d);
             return;
         }
         // 借系统自己的策略逻辑来发起连接:PhonePolicy 监听 ACTION_UUID,一收到就
@@ -283,10 +291,23 @@ public final class Rearm {
         // 的即时连接必然失败(实测每 10 秒试一次,一次都连不上)。true 是把设备挂进
         // 系统的后台等待名单,它一广播就自动接上,这正是"布防"要的语义。
         // 已经挂在等待名单里的不再重挂 —— 重建客户端会把名单清掉。
+        ensureGatt(d);
+    }
+
+    /**
+     * 确保这台设备有一个我们自己的 GATT 客户端。保活与读电量都要用它,而系统
+     * 接管的那条 HID 链路是另一回事,借不到。
+     *
+     * <p>已经挂着的不重挂 —— 重建客户端会把系统的后台等待名单清掉。
+     * connectGatt 返回 null 时不记账,否则那个空位会永远挡住重试。
+     */
+    private static void ensureGatt(BluetoothDevice d) {
+        String mac = d.getAddress();
         synchronized (Rearm.class) {
             if (gatts.containsKey(mac)) return;
             try {
-                gatts.put(mac, d.connectGatt(ctx, true, CALLBACK, BluetoothDevice.TRANSPORT_LE));
+                BluetoothGatt g = d.connectGatt(ctx, true, CALLBACK, BluetoothDevice.TRANSPORT_LE);
+                if (g != null) gatts.put(mac, g);
             } catch (SecurityException e) {
                 nativeOnError("连接 " + mac + " 失败: " + e);
             }
@@ -363,7 +384,12 @@ public final class Rearm {
             g = gatts.get(mac);
             target = keepaliveTarget.get(mac);
         }
-        if (g == null || target == null) return;
+        if (g == null) {
+            BluetoothDevice d = bonded(mac);
+            if (d != null) ensureGatt(d);
+            return;
+        }
+        if (target == null) return;
         try {
             g.readCharacteristic(target);
         } catch (SecurityException e) {
