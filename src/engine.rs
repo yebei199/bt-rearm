@@ -161,7 +161,9 @@ impl Engine {
             return Action::Skip("未布防");
         }
         self.sync_connected(mac, system_connected, now_ms);
-        if system_connected {
+        // 看校正过的状态而不是平台的当场判断:链路刚建好的那几秒平台会说「没连」,
+        // 照它办就会往一条正在建立的链路上再发一次连接。
+        if self.connected.contains(mac) {
             // 系统自己连上了就让路 —— 这正是布防该袖手的时候。
             self.note(
                 now_ms,
@@ -198,7 +200,7 @@ impl Engine {
             return Action::Skip("未布防");
         }
         self.sync_connected(mac, system_connected, now_ms);
-        if system_connected {
+        if self.connected.contains(mac) {
             self.blind_gap.remove(mac);
             self.note(
                 now_ms,
@@ -223,6 +225,14 @@ impl Engine {
         );
         self.note(now_ms, format!("{mac} 盲试连接"));
         Action::Connect
+    }
+
+    /// 把领走的低延迟许可还回来。
+    ///
+    /// 许可在安卓那侧真正发出去之前就被领走了,那一侧失败的话不还回来,这条链路
+    /// 就再没有第二次机会 —— 而低延迟正是这个工具的手感所系。
+    pub fn return_low_latency_permit(&mut self, mac: &str) {
+        self.low_latency_sent.remove(mac);
     }
 
     /// 领取一次「把连接参数压到低延迟档」的许可。
@@ -450,6 +460,19 @@ impl Engine {
     /// 用在两个时机:权限刚批下来(此前的开扫必然失败),以及扫描被系统掐掉后重开。
     pub fn scan_command(&mut self, now_ms: u64) -> Scan {
         self.commit_scan_at(now_ms)
+    }
+
+    /// 安卓那侧没能把扫描开起来。
+    ///
+    /// 引擎记的是「我下发过什么」而不是「平台真的在扫」,这是有意的 —— 每个事件
+    /// 都重下指令会让扫描不停地停开,那本身就是射频扰动。代价是失败必须报回来,
+    /// 否则目标状态没变就再也不会重下,扫描永远回不来。
+    pub fn on_scan_failed(&mut self, now_ms: u64) {
+        self.last_scan = None;
+        self.note(
+            now_ms,
+            "扫描没能开起来,下一轮重试".into(),
+        );
     }
 
     /// 目标扫描状态与上次下发的不同时才返回。
@@ -1223,6 +1246,86 @@ mod tests {
         assert_eq!(
             e.attention(true, true, 10_000_000),
             None
+        );
+    }
+
+    // ---- 审计出来的几个真问题 ----
+
+    #[test]
+    fn advertisement_does_not_reconnect_while_link_is_still_settling()
+     {
+        // 链路刚建好的那几秒,平台的 HID 视图还没跟上,会报「没连」。扫描那一侧
+        // 已经按 ACL 事实兜住了,发起连接这一侧却还在看那个慢信号 —— 于是会往
+        // 一条正在建立的链路上再发一次特权连接。
+        let mut e = armed_engine();
+        e.on_connection_change(PAD, true, 1_000);
+        let late = 1_000 + RETRY_GAP_MS + 1;
+        assert!(
+            late < 1_000 + SETTLE_MS,
+            "这一刻仍在稳定窗口内"
+        );
+        assert_eq!(
+            e.on_advertisement(PAD, false, late),
+            Action::Skip("系统已连接")
+        );
+    }
+
+    #[test]
+    fn tick_does_not_reconnect_while_link_is_still_settling()
+     {
+        // 盲试那一路同理。
+        let mut e = armed_engine();
+        e.on_connection_change(PAD, true, 1_000);
+        let late = 1_000 + BLIND_GAP_MS + 1;
+        assert!(
+            late < 1_000 + SETTLE_MS,
+            "这一刻仍在稳定窗口内"
+        );
+        assert_eq!(
+            e.on_tick(PAD, false, late),
+            Action::Skip("系统已连接")
+        );
+    }
+
+    #[test]
+    fn scan_is_reissued_after_the_platform_refuses_to_start_it()
+     {
+        // 开扫可能失败:蓝牙关着拿不到扫描器、权限被撤、或者平台直接回一个错误码。
+        // 引擎记的是「我下发过什么」,不是「平台真的在扫」—— 不把失败告诉它,
+        // 目标状态没变就再也不会重下,扫描永远回不来。
+        let mut e = armed_engine();
+        assert!(matches!(
+            e.scan_command(1_000),
+            Scan::Start { .. }
+        ));
+        assert_eq!(
+            e.scan_if_changed(2_000),
+            None,
+            "没变就不重下"
+        );
+        e.on_scan_failed(3_000);
+        assert!(
+            matches!(
+                e.scan_if_changed(4_000),
+                Some(Scan::Start { .. })
+            ),
+            "知道失败之后应当重下"
+        );
+    }
+
+    #[test]
+    fn low_latency_permit_comes_back_when_the_request_fails()
+     {
+        // 许可是「每条链路只发一次」,可它在安卓那侧真正发出去之前就被收走了。
+        // 那一侧失败(设备不在配对列表、拿不到 GATT 客户端)许可就白烧,这条
+        // 链路再没有第二次机会。
+        let mut e = armed_engine();
+        e.on_connection_change(PAD, true, 1_000);
+        assert!(e.take_low_latency_request(PAD));
+        e.return_low_latency_permit(PAD);
+        assert!(
+            e.take_low_latency_request(PAD),
+            "失败后应当还能再领一次"
         );
     }
 }

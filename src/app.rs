@@ -183,6 +183,25 @@ macro_rules! call_bool {
     }};
 }
 
+/// 收一个字符串参数、返回布尔值的静态方法。
+macro_rules! call_str_bool {
+    ($name:literal, $arg:expr) => {{
+        let got = vm().attach_current_thread(|env| {
+            let s = env.new_string($arg)?;
+            env.call_static_method(
+                jni::jni_str!(
+                    "io/github/yebei199/btrearm/Rearm"
+                ),
+                jni::jni_str!($name),
+                jni::jni_sig!("(Ljava/lang/String;)Z"),
+                &[(&s).into()],
+            )?
+            .z()
+        });
+        got.unwrap_or(false)
+    }};
+}
+
 /// 收一个字符串参数、无返回值的静态方法。
 macro_rules! call_with_str {
     ($name:literal, $arg:expr) => {{
@@ -291,8 +310,12 @@ fn with_engine<T>(f: impl FnOnce(&mut Engine) -> T) -> T {
 
 /// 领到许可就请求把连接参数压到低延迟档。引擎保证每条链路只发一次。
 fn claim_low_latency(mac: &str) {
-    if with_engine(|e| e.take_low_latency_request(mac)) {
-        call_with_str!("requestLowLatency", mac);
+    if !with_engine(|e| e.take_low_latency_request(mac)) {
+        return;
+    }
+    // 许可是每条链路一次,安卓那侧没发出去就得还回来,否则这条链路再没机会。
+    if !call_str_bool!("requestLowLatency", mac) {
+        with_engine(|e| e.return_low_latency_permit(mac));
     }
 }
 
@@ -419,7 +442,6 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeTick<
             if action == Action::Connect {
                 call_connect(&mac);
             }
-            update_scan();
             // 应用启动时设备可能已经连着,那一刻不会再有连接广播 —— 巡检补发。
             claim_low_latency(&mac);
             // 保活:试探手柄固件认不认平板发来的数据算「有活动」,从而推迟休眠。
@@ -428,6 +450,8 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeTick<
                 call_with_str!("keepAlive", &mac);
             }
         }
+        // 扫描目标只跟整份名单有关,一轮巡检结算一次就够,不必每台设备算一遍。
+        update_scan();
         // 自动那条路走不通时喊人。两个事实只有安卓那侧知道,取来交给引擎判断。
         let bt_on = call_bool!("bluetoothOn");
         let ready = call_bool!("privilegedReady");
@@ -500,6 +524,24 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnConnectionC
 }
 
 /// Java 侧的异常与失败,原样进日志给用户看。
+/// 安卓那侧没能把扫描开起来 —— 蓝牙关着、权限被撤,或者平台回了错误码。
+///
+/// 必须报回来:引擎记的是「我下发过什么」,不报的话目标状态没变就再也不重下,
+/// 扫描永远回不来。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnScanFailed<
+    'c,
+>(
+    mut env: jni::EnvUnowned<'c>,
+    _class: jni::objects::JClass<'c>,
+) {
+    env.with_env(|_env| -> jni::errors::Result<()> {
+        with_engine(|e| e.on_scan_failed(now_ms()));
+        Ok(())
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnError<
     'c,
@@ -537,9 +579,17 @@ fn call_connect(mac: &str) {
 }
 
 /// 墙上时钟毫秒数,喂给引擎做节流与日志计龄。
+/// 进程启动以来的毫秒数。
+///
+/// 用单调时钟而不是墙钟:引擎里每一处判断都是「距上次过了多久」,而墙钟会跳 ——
+/// 开机后对时、用户改时区都能让它一步跨过几小时。往前跳会把所有退避、稳定窗口、
+/// 提醒阈值同时引爆,往后跳则让 saturating_sub 一直算出 0,退避与提醒就此冻住。
+/// 原点是任意的,引擎只用差值,不在乎。
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    static START: OnceLock<std::time::Instant> =
+        OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }

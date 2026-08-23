@@ -9,7 +9,6 @@ import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGatt;
 import android.bluetooth.BluetoothGattCallback;
 import android.bluetooth.BluetoothGattCharacteristic;
-import android.bluetooth.BluetoothGattDescriptor;
 import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothManager;
 import android.bluetooth.BluetoothProfile;
@@ -72,14 +71,6 @@ public final class Rearm {
 
     /** 上一次弹出的正文,用来避免同一句话反复打扰。 */
     private static String lastAttention = "";
-
-    /** 输入上报的类型字节,位置是倒数第二个。 */
-    private static final int REPORT_KIND_TAIL = 2;
-
-    private static final byte INPUT_REPORT = (byte) 0xfe;
-
-    /** 上一条打过的状态包,内容没变就不重复打。 */
-    private static String lastVendorLine = "";
     /** 当前挂着的 GATT 客户端,按 MAC 存,断开时释放。 */
     private static final Map<String, BluetoothGatt> gatts = new HashMap<>();
     /** 每台设备用于保活的可读特征,服务发现完成后确定。 */
@@ -101,13 +92,6 @@ public final class Rearm {
         return new Handler(thread.getLooper());
     }
     private static final long TICK_MS = 10_000L;
-    /** 飞智走的是 Nordic UART 私有通道,电量多半从这里问。临时探针用。 */
-    private static final UUID NUS_SERVICE =
-            UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e");
-
-    private static final UUID CCCD =
-            UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
-
     private static final UUID HID_SERVICE = UUID.fromString("00001812-0000-1000-8000-00805f9b34fb");
 
     private Rearm() {}
@@ -141,36 +125,14 @@ public final class Rearm {
             try {
                 g.discoverServices();
             } catch (SecurityException e) {
-                nativeOnError("服务发现失败: " + e);
+                log("服务发现失败: " + e);
             }
-        }
-
-        @Override
-        public void onCharacteristicChanged(
-                BluetoothGatt g, BluetoothGattCharacteristic c, byte[] value) {
-            // 这条通道上绝大多数是手柄的输入上报(倒数第二字节 0xfe),每秒几十条,
-            // 全打出来既刷屏又费电。只留状态包,而且内容没变就不重复打。
-            if (value.length < REPORT_KIND_TAIL || value[value.length - REPORT_KIND_TAIL] == INPUT_REPORT) {
-                return;
-            }
-            StringBuilder hex = new StringBuilder("私有通道");
-            for (byte b : value) hex.append(String.format(" %02x", b));
-            String line = hex.toString();
-            if (line.equals(lastVendorLine)) return;
-            lastVendorLine = line;
-            log(line);
         }
 
         @Override
         public void onServicesDiscovered(BluetoothGatt g, int status) {
             if (status != BluetoothGatt.GATT_SUCCESS) return;
             String mac = g.getDevice().getAddress();
-            StringBuilder found = new StringBuilder("服务:");
-            for (BluetoothGattService svc : g.getServices()) {
-                found.append(' ').append(svc.getUuid());
-            }
-            log(found.toString());
-            subscribeVendor(g);
             BluetoothGattCharacteristic pick = pickReadable(g);
             if (pick == null) {
                 log("没有可用于保活的特征 " + mac);
@@ -189,7 +151,7 @@ public final class Rearm {
                 int status) {
             // 读成功即说明数据确实到手柄走了一圈,这正是保活想要的效果。
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                nativeOnError("保活读取失败 " + g.getDevice().getAddress()
+                log("保活读取失败 " + g.getDevice().getAddress()
                         + " 状态 " + status);
             }
         }
@@ -217,7 +179,7 @@ public final class Rearm {
                     BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.class);
             if (d == null) return;
             if (BluetoothDevice.ACTION_UUID.equals(intent.getAction())) {
-                nativeOnError("服务发现完成 " + d.getAddress());
+                log("服务发现完成 " + d.getAddress());
                 return;
             }
             nativeOnConnectionChange(
@@ -238,7 +200,8 @@ public final class Rearm {
         String[] macs = macList.isEmpty() ? new String[0] : macList.split("\n");
         BluetoothLeScanner scanner = scanner();
         if (scanner == null) {
-            nativeOnError("拿不到扫描器,蓝牙可能已关闭");
+            log("拿不到扫描器,蓝牙可能已关闭");
+            nativeOnScanFailed();
             return;
         }
         try {
@@ -266,7 +229,8 @@ public final class Rearm {
             scanner.startScan(filters, settings, SCAN);
             scanning = true;
         } catch (SecurityException e) {
-            nativeOnError("开扫失败: " + e);
+            log("开扫失败: " + e);
+            nativeOnScanFailed();
         }
     }
 
@@ -277,7 +241,7 @@ public final class Rearm {
             scanner.stopScan(SCAN);
             scanning = false;
         } catch (SecurityException e) {
-            nativeOnError("停扫失败: " + e);
+            log("停扫失败: " + e);
         }
     }
 
@@ -297,14 +261,14 @@ public final class Rearm {
     public static void connect(String mac) {
         BluetoothDevice d = bonded(mac);
         if (d == null) {
-            nativeOnError(mac + " 不在已配对列表里");
+            log(mac + " 不在已配对列表里");
             return;
         }
         // 首选:借 Shizuku 的 shell 身份让系统自己接管 —— 这是唯一能真正换来
         // 系统「已连接」、手柄可用的路径。不可用时才退回下面两条自救手段。
         String privileged = Privileged.connect(mac);
         if (privileged != null) {
-            nativeOnError(privileged);
+            log(privileged);
             // 系统接管了链路,但保活和读电量用的是我们自己的 GATT 客户端 ——
             // 以前这里直接返回,那两件事便一直在空转。
             ensureGatt(d);
@@ -316,9 +280,9 @@ public final class Rearm {
         // 让系统重新发现一次服务 UUID,连接就由系统自己发起,不需要任何特权。
         // fetchUuidsWithSdp 只要 BLUETOOTH_CONNECT,这个权限我们有。
         try {
-            nativeOnError("请求重新发现服务=" + d.fetchUuidsWithSdp());
+            log("请求重新发现服务=" + d.fetchUuidsWithSdp());
         } catch (SecurityException e) {
-            nativeOnError("请求重新发现服务失败: " + e);
+            log("请求重新发现服务失败: " + e);
         }
         // autoConnect=true:BLE 里连接只能由广播触发 —— 外设睡着时 autoConnect=false
         // 的即时连接必然失败(实测每 10 秒试一次,一次都连不上)。true 是把设备挂进
@@ -342,7 +306,7 @@ public final class Rearm {
                 BluetoothGatt g = d.connectGatt(ctx, true, CALLBACK, BluetoothDevice.TRANSPORT_LE);
                 if (g != null) gatts.put(mac, g);
             } catch (SecurityException e) {
-                nativeOnError("连接 " + mac + " 失败: " + e);
+                log("连接 " + mac + " 失败: " + e);
             }
         }
     }
@@ -361,28 +325,26 @@ public final class Rearm {
      *
      * <p>要不要对某台设备做,由 Rust 引擎判断(只对布防中且已连上的设备做)。
      */
-    public static void requestLowLatency(String mac) {
+    /**
+     * 把这条链路的连接参数压到低延迟档。
+     *
+     * @return 请求是否真的发出去了。没发出去要让引擎把「每条链路一次」的许可
+     *     还回来,否则这条链路再没有第二次机会。
+     */
+    public static boolean requestLowLatency(String mac) {
         BluetoothGatt existing;
         synchronized (Rearm.class) {
             existing = gatts.get(mac);
         }
-        if (existing != null) {
-            applyHighPriority(mac, existing);
-            return;
-        }
+        if (existing != null) return applyHighPriority(mac, existing);
         BluetoothDevice d = bonded(mac);
-        if (d == null) return;
-        try {
-            // 设备此刻已由系统连着,autoConnect=false 会立刻附到现有链路上,
-            // 连上后回调里再提参数请求。
-            BluetoothGatt g =
-                    d.connectGatt(ctx, false, CALLBACK, BluetoothDevice.TRANSPORT_LE);
-            synchronized (Rearm.class) {
-                gatts.put(mac, g);
-            }
-        } catch (SecurityException e) {
-            nativeOnError("请求低延迟失败: " + e);
+        if (d == null) {
+            log(mac + " 不在已配对列表里,没法压低延迟");
+            return false;
         }
+        // 客户端还没建好,这一轮先把它拉起来;连上后回调里会自己提参数请求。
+        ensureGatt(d);
+        return false;
     }
 
     /**
@@ -391,44 +353,6 @@ public final class Rearm {
      * <p>避开 HID 服务(0x1812):安卓禁止普通应用访问它,读会抛 SecurityException。
      * 设备信息服务里的型号、固件版本之类是只读常量,读它对手柄没有副作用。
      */
-    /**
-     * 订阅厂商私有通道上所有会主动推送的特征,把收到的字节打进日志。
-     *
-     * <p>这是个探针:手柄没有标准电池服务(0x180F),而飞智自己的界面能显示电量,
-     * 说明电量走的是这条 Nordic UART 通道。多个 GATT 客户端共用同一条 ATT 链路,
-     * 所以飞智问电量时的回包,我们这边订阅了也能收到 —— 能不能收到正是要验的。
-     */
-    private static void subscribeVendor(BluetoothGatt g) {
-        BluetoothGattService svc = g.getService(NUS_SERVICE);
-        if (svc == null) {
-            log("没有厂商私有通道");
-            return;
-        }
-        for (BluetoothGattCharacteristic c : svc.getCharacteristics()) {
-            int props = c.getProperties();
-            log("特征 " + c.getUuid().toString().substring(4, 8)
-                    + " props=0x" + Integer.toHexString(props));
-            boolean pushes =
-                    (props
-                                    & (BluetoothGattCharacteristic.PROPERTY_NOTIFY
-                                            | BluetoothGattCharacteristic.PROPERTY_INDICATE))
-                            != 0;
-            if (!pushes) continue;
-            try {
-                g.setCharacteristicNotification(c, true);
-                BluetoothGattDescriptor cccd = c.getDescriptor(CCCD);
-                if (cccd == null) continue;
-                byte[] on =
-                        (props & BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0
-                                ? BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                                : BluetoothGattDescriptor.ENABLE_INDICATION_VALUE;
-                g.writeDescriptor(cccd, on);
-            } catch (SecurityException e) {
-                log("订阅失败: " + e);
-            }
-        }
-    }
-
     private static BluetoothGattCharacteristic pickReadable(BluetoothGatt g) {
         for (BluetoothGattService svc : g.getServices()) {
             if (HID_SERVICE.equals(svc.getUuid())) continue;
@@ -464,17 +388,19 @@ public final class Rearm {
         try {
             g.readCharacteristic(target);
         } catch (SecurityException e) {
-            nativeOnError("保活失败: " + e);
+            log("保活失败: " + e);
         }
     }
 
-    private static void applyHighPriority(String mac, BluetoothGatt g) {
+    private static boolean applyHighPriority(String mac, BluetoothGatt g) {
         try {
             boolean accepted =
                     g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH);
-            nativeOnError((accepted ? "已请求低延迟 " : "低延迟请求被拒 ") + mac);
+            log((accepted ? "已请求低延迟 " : "低延迟请求被拒 ") + mac);
+            return accepted;
         } catch (SecurityException e) {
-            nativeOnError("请求低延迟失败: " + e);
+            log("请求低延迟失败: " + e);
+            return false;
         }
     }
 
@@ -574,7 +500,7 @@ public final class Rearm {
 
     /** 权限到手后让 Rust 按当前布防名单重开扫描,并起定时轮询。 */
     public static void resumeScan() {
-        nativeOnError(describeBonded());
+        log(describeBonded());
         nativeResumeScan();
         startTicking();
     }
@@ -652,7 +578,7 @@ public final class Rearm {
 
     /** 供同包内其它类往界面日志写一行。 */
     static void note(String line) {
-        nativeOnError(line);
+        log(line);
     }
 
     // ---- Java 转给 Rust 的事件 ----
@@ -666,6 +592,8 @@ public final class Rearm {
     private static native void nativeOnConnectionChange(String mac, boolean connected);
 
     private static native void nativeOnError(String message);
+
+    private static native void nativeOnScanFailed();
 
     /**
      * 往应用内日志写一行,同时抄一份进 logcat。
@@ -690,7 +618,8 @@ public final class Rearm {
             synchronized (Rearm.class) {
                 scanning = false;
             }
-            nativeOnError("扫描失败,错误码 " + errorCode);
+            log("扫描失败,错误码 " + errorCode);
+            nativeOnScanFailed();
         }
     };
 
