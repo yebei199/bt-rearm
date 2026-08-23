@@ -328,11 +328,13 @@ fn platform_view_wins_after_the_settle_window() {
     // 当场判断说了算,否则又回到「扫描永不恢复」。
     let mut e = armed_engine();
     e.on_connection_change(PAD, true, 1_000);
-    e.scan_if_changed(0);
+    let late = 1_000 + SETTLE_MS + 1;
+    e.scan_if_changed(late);
 
-    e.on_tick(PAD, false, 1_000 + SETTLE_MS + 1);
+    e.on_tick(PAD, false, late);
+    // 那一次盲试刚发出去,扫描先让位给发起器;重试窗口一过就该恢复。
     assert_eq!(
-        e.scan_if_changed(0),
+        e.scan_if_changed(late + RETRY_GAP_MS),
         Some(Scan::Start {
             macs: vec![PAD.into()],
             fast: true
@@ -349,11 +351,11 @@ fn tick_clears_a_stale_connected_flag_and_scanning_resumes()
     // 五分钟一次的盲试兜底,手柄回来后要等很久才被接上。
     let mut e = armed_engine();
     e.on_connection_change(PAD, true, 1_000);
-    assert_eq!(e.scan_if_changed(0), Some(Scan::Stop));
+    assert_eq!(e.scan_if_changed(1_000), Some(Scan::Stop));
 
     e.on_tick(PAD, false, 40_000);
     assert_eq!(
-        e.scan_if_changed(0),
+        e.scan_if_changed(40_000 + RETRY_GAP_MS),
         Some(Scan::Start {
             macs: vec![PAD.into()],
             fast: true
@@ -725,4 +727,59 @@ fn low_latency_permit_comes_back_when_the_request_fails() {
         e.take_low_latency_request(PAD),
         "失败后应当还能再领一次"
     );
+}
+
+#[test]
+fn scanning_pauses_while_a_connect_attempt_is_in_flight() {
+    // 连接发出去之后的那几秒,收到的广播引擎一律按「连接中」跳过 —— 建链本身要
+    // 几秒,不能被打断。既然这段时间的广播不会被采纳,扫描就是白扫,而它偏偏是
+    // 满占空比的,一直占着接收机;系统的连接发起器要用同一个射频去等对方广播。
+    let mut e = armed_engine();
+    e.on_connection_change(PAD, true, 1_000);
+    e.on_connection_change(PAD, false, 2_000);
+    assert!(matches!(
+        e.scan_command(2_000),
+        Scan::Start { .. }
+    ));
+    assert_eq!(
+        e.on_advertisement(PAD, false, 3_000),
+        Action::Connect
+    );
+    assert_eq!(
+        e.scan_command(3_000),
+        Scan::Stop,
+        "发起连接后应当停扫"
+    );
+}
+
+#[test]
+fn scanning_resumes_when_the_attempt_did_not_land() {
+    // 这次尝试没能把设备接回来,退避窗口一过就得重新去听广播,否则一次失败
+    // 就此失明。
+    let mut e = armed_engine();
+    e.on_connection_change(PAD, true, 1_000);
+    e.on_connection_change(PAD, false, 2_000);
+    e.on_advertisement(PAD, false, 3_000);
+    assert_eq!(e.scan_command(3_000), Scan::Stop);
+    assert!(
+        matches!(
+            e.scan_command(3_000 + RETRY_GAP_MS),
+            Scan::Start { .. }
+        ),
+        "退避窗口过了要复扫"
+    );
+}
+
+#[test]
+fn one_device_being_connected_does_not_blind_the_others() {
+    // 停扫只针对正在尝试的那一台,别的布防设备该扫还得扫。
+    let mut e = armed_engine();
+    e.toggle(MOUSE, 0);
+    e.on_advertisement(PAD, false, 3_000);
+    match e.scan_command(3_000) {
+        Scan::Start { macs, .. } => {
+            assert_eq!(macs, vec![MOUSE.to_string()])
+        }
+        other => panic!("另一台还该扫: {other:?}"),
+    }
 }

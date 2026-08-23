@@ -440,6 +440,8 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeTick<
                 e.on_tick(&mac, connected, now)
             });
             if action == Action::Connect {
+                // 同上:停扫要赶在发连接之前。
+                update_scan();
                 call_connect(&mac);
             }
             // 应用启动时设备可能已经连着,那一刻不会再有连接广播 —— 巡检补发。
@@ -484,10 +486,12 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnAdvertiseme
         let action = with_engine(|e| {
             e.on_advertisement(&mac, connected, now)
         });
+        // 顺序要紧:先把扫描停掉再发连接。发起器要用同一个接收机去等对方的
+        // 广播,别让一个已经没用的扫描占着它。
+        update_scan();
         if action == Action::Connect {
             call_connect(&mac);
         }
-        update_scan();
         claim_low_latency(&mac);
         Ok(())
     })

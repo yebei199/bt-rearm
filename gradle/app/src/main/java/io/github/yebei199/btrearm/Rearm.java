@@ -228,6 +228,8 @@ public final class Rearm {
                     .build();
             scanner.startScan(filters, settings, SCAN);
             scanning = true;
+            // 开停扫的时刻是重连耗时分段的锚点,掐表全靠它。
+            log("开扫 " + (fast ? "满占空比" : "省电") + " 目标=" + macs.length);
         } catch (SecurityException e) {
             log("开扫失败: " + e);
             nativeOnScanFailed();
@@ -240,6 +242,7 @@ public final class Rearm {
         try {
             scanner.stopScan(SCAN);
             scanning = false;
+            log("停扫");
         } catch (SecurityException e) {
             log("停扫失败: " + e);
         }

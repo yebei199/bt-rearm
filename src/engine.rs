@@ -499,6 +499,10 @@ impl Engine {
             .armed
             .iter()
             .filter(|mac| !self.connected.contains(*mac))
+            // 连接已经发出去的那几秒也别扫。那段时间收到的广播引擎一律按
+            // 「连接中」跳过,扫了也不会被采纳;而满占空比扫描一直占着接收机,
+            // 系统的连接发起器要用同一个射频去等对方的广播。
+            .filter(|mac| !self.attempt_in_flight(mac, now_ms))
             .cloned()
             .collect();
         if waiting.is_empty() {
@@ -519,6 +523,19 @@ impl Engine {
             macs: waiting,
             fast,
         }
+    }
+
+    /// 这台设备上有没有一次刚发出去、还没有结果的连接尝试。
+    ///
+    /// 判据就是重试窗口本身:窗口内不会再发第二次,也不会采纳任何广播。
+    fn attempt_in_flight(
+        &self,
+        mac: &str,
+        now_ms: u64,
+    ) -> bool {
+        self.last_try.get(mac).is_some_and(|last| {
+            now_ms.saturating_sub(*last) < RETRY_GAP_MS
+        })
     }
 
     fn commit_scan_at(&mut self, now_ms: u64) -> Scan {
