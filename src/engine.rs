@@ -19,6 +19,14 @@ pub const BLIND_GAP_MS: u64 = 10_000;
 /// 广播时(后台扫描被系统压制),盲试是唯一的活路,放弃它等于放弃布防。
 pub const BLIND_GAP_MAX_MS: u64 = 300_000;
 
+/// 链路刚建立后的稳定窗口,窗口内以 ACL 事实为准。
+///
+/// 平台给的两个信号快慢不同:ACL 广播链路一起来就到,而输入设备列表要等 HID
+/// profile 完全起来才转真,中间有几秒空窗。让慢的覆盖快的,扫描会在链路建立
+/// 中途被重开 —— 那是射频最紧张的时刻。取值远大于建链耗时的几秒,又远小于
+/// 盲试退避的上限,窗口外仍由平台的当场判断兜底,免得回到「扫描永不恢复」。
+pub const SETTLE_MS: u64 = 30_000;
+
 /// 收到一条广播后,决定要不要动手。
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
@@ -64,6 +72,8 @@ pub struct Engine {
     blind_gap: HashMap<String, u64>,
     /// 上一次下发给安卓侧的扫描指令,用来避免重复下发。
     last_scan: Option<Scan>,
+    /// 各设备 ACL 链路建立的时刻,用于判断是否还在稳定窗口内。
+    acl_since: HashMap<String, u64>,
     /// 本次链路已经发过低延迟请求的设备。断开即清。
     low_latency_sent: HashSet<String>,
     log: Vec<Entry>,
@@ -119,7 +129,7 @@ impl Engine {
         if !self.armed.contains(mac) {
             return Action::Skip("未布防");
         }
-        self.sync_connected(mac, system_connected);
+        self.sync_connected(mac, system_connected, now_ms);
         if system_connected {
             // 系统自己连上了就让路 —— 这正是布防该袖手的时候。
             self.note(
@@ -156,7 +166,7 @@ impl Engine {
         if !self.armed.contains(mac) {
             return Action::Skip("未布防");
         }
-        self.sync_connected(mac, system_connected);
+        self.sync_connected(mac, system_connected, now_ms);
         if system_connected {
             self.blind_gap.remove(mac);
             self.note(
@@ -214,14 +224,21 @@ impl Engine {
         &mut self,
         mac: &str,
         system_connected: bool,
+        now_ms: u64,
     ) {
         if system_connected {
             self.connected.insert(mac.to_string());
-        } else {
-            self.connected.remove(mac);
-            // 链路没了,已发的低延迟请求也随之失效,下次连上要重新发。
-            self.low_latency_sent.remove(mac);
+            return;
         }
+        // 刚建好的链路上,平台的 HID 视图还没跟上,此时它说「没连」不作数。
+        if let Some(since) = self.acl_since.get(mac)
+            && now_ms.saturating_sub(*since) < SETTLE_MS
+        {
+            return;
+        }
+        self.connected.remove(mac);
+        // 链路没了,已发的低延迟请求也随之失效,下次连上要重新发。
+        self.low_latency_sent.remove(mac);
     }
 
     /// 连接状态变了(我们连上的,或链路断了)。
@@ -231,7 +248,13 @@ impl Engine {
         connected: bool,
         now_ms: u64,
     ) {
-        self.sync_connected(mac, connected);
+        if connected {
+            // ACL 事实优先:记下建链时刻,稳定窗口内不让慢信号推翻它。
+            self.acl_since.insert(mac.to_string(), now_ms);
+        } else {
+            self.acl_since.remove(mac);
+        }
+        self.sync_connected(mac, connected, now_ms);
         if connected {
             self.blind_gap.remove(mac);
             self.note(now_ms, format!("{mac} 已连接"));
@@ -626,6 +649,39 @@ mod tests {
     }
 
     #[test]
+    fn hid_view_lag_does_not_restart_scanning_on_a_fresh_link() {
+        // 两个信号快慢不同:ACL 广播链路一起来就到,而平台的 HID 视图(输入设备
+        // 列表)要等 HID profile 完全起来才转真,中间有几秒空窗。让慢的覆盖快的,
+        // 扫描就会在链路建立中途被重开 —— 那是射频最紧张的时刻,既拖慢建链,
+        // 也是 0x08 监督超时的已知诱因。
+        let mut e = armed_engine();
+        e.on_connection_change(PAD, true, 1_000);
+        assert_eq!(e.scan_if_changed(), Some(Scan::Stop));
+
+        e.on_tick(PAD, false, 11_000);
+        assert_eq!(
+            e.scan_if_changed(),
+            None,
+            "空窗期内不该重开扫描"
+        );
+    }
+
+    #[test]
+    fn platform_view_wins_after_the_settle_window() {
+        // 但空窗不能无限延长:ACL 断开广播可能丢失,过了稳定窗口就该由平台的
+        // 当场判断说了算,否则又回到「扫描永不恢复」。
+        let mut e = armed_engine();
+        e.on_connection_change(PAD, true, 1_000);
+        e.scan_if_changed();
+
+        e.on_tick(PAD, false, 1_000 + SETTLE_MS + 1);
+        assert_eq!(
+            e.scan_if_changed(),
+            Some(Scan::Start(vec![PAD.into()]))
+        );
+    }
+
+    #[test]
     fn tick_clears_a_stale_connected_flag_and_scanning_resumes()
      {
         // 断开广播可能丢失:进程被冻结、被杀后重启、广播风暴时都会漏。
@@ -636,7 +692,7 @@ mod tests {
         e.on_connection_change(PAD, true, 1_000);
         assert_eq!(e.scan_if_changed(), Some(Scan::Stop));
 
-        e.on_tick(PAD, false, 20_000);
+        e.on_tick(PAD, false, 40_000);
         assert_eq!(
             e.scan_if_changed(),
             Some(Scan::Start(vec![PAD.into()]))
@@ -649,7 +705,7 @@ mod tests {
         let mut e = armed_engine();
         e.on_connection_change(PAD, true, 1_000);
         e.scan_if_changed();
-        e.on_advertisement(PAD, false, 20_000);
+        e.on_advertisement(PAD, false, 40_000);
         assert_eq!(e.row(PAD).state, "正在连接");
     }
 
