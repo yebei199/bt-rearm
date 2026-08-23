@@ -279,20 +279,15 @@ fn keepalive_is_paced_and_only_sent_while_connected() {
     // 保活是发给「连着的手柄」的:没连上时发无处可发。节奏也要限住,
     // 每分钟一次足够试探固件,再密只是白耗电。
     let mut e = armed_engine();
-    assert!(!e.take_keepalive(PAD, 0), "没连上时不该发");
+    assert!(!e.keepalive_due(PAD, 0), "没连上时不该发");
 
     e.on_connection_change(PAD, true, 1_000);
-    assert!(e.take_keepalive(PAD, 1_000));
+    assert!(e.keepalive_due(PAD, 1_000));
     assert!(
-        !e.take_keepalive(
-            PAD,
-            1_000 + KEEPALIVE_GAP_MS - 1
-        ),
+        !e.keepalive_due(PAD, 1_000 + KEEPALIVE_GAP_MS - 1),
         "未到间隔不该重发"
     );
-    assert!(
-        e.take_keepalive(PAD, 1_000 + KEEPALIVE_GAP_MS)
-    );
+    assert!(e.keepalive_due(PAD, 1_000 + KEEPALIVE_GAP_MS));
 }
 
 #[test]
@@ -300,7 +295,7 @@ fn keepalive_is_not_sent_to_unarmed_devices() {
     // 没布防的设备不归我们管,别去打扰它的链路。
     let mut e = armed_engine();
     e.on_connection_change(MOUSE, true, 1_000);
-    assert!(!e.take_keepalive(MOUSE, 1_000));
+    assert!(!e.keepalive_due(MOUSE, 1_000));
 }
 
 #[test]
@@ -782,4 +777,21 @@ fn one_device_being_connected_does_not_blind_the_others() {
         }
         other => panic!("另一台还该扫: {other:?}"),
     }
+}
+
+#[test]
+fn keepalive_is_currently_switched_off() {
+    // 保活的收益从未验证,而它刚开始真正发出去,掉线就密了起来 —— 相关性不等于
+    // 因果,但它往手柄输入所用的同一条链路上定期塞数据,先关掉做对照。
+    // 这个用例是那个决定的留痕:哪天把开关拨回去,它会立刻提醒你改了什么。
+    let mut e = armed_engine();
+    e.on_connection_change(PAD, true, 1_000);
+    assert!(
+        e.keepalive_due(PAD, 1_000),
+        "内层规则本身仍然成立"
+    );
+    assert!(
+        !e.take_keepalive(PAD, 60_000),
+        "但总开关关着,对外一律不发"
+    );
 }
