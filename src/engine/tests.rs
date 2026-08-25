@@ -209,29 +209,52 @@ fn connected_armed_device_wants_low_latency() {
     // 就该由我们主动去压,而不是让用户等。
     let mut e = armed_engine();
     assert!(
-        !e.take_low_latency_request(PAD),
+        !e.take_low_latency_request(PAD, 0),
         "还没连上时不该动参数"
     );
     e.on_connection_change(PAD, true, 1_000);
-    assert!(e.take_low_latency_request(PAD));
+    assert!(e.take_low_latency_request(PAD, 1_000));
 }
 
 #[test]
-fn low_latency_is_requested_once_per_link() {
-    // 参数是链路属性,连上后重复请求既无意义又会刷满日志;断开重连要能再发。
+fn low_latency_is_paced_not_spammed() {
+    // 刚发过就别再发:每次参数更新都要双方在一个约定时刻同步切换,连着刷
+    // 既无意义又是实打实的空口开销。
     let mut e = armed_engine();
     e.on_connection_change(PAD, true, 1_000);
-    assert!(e.take_low_latency_request(PAD));
+    assert!(e.take_low_latency_request(PAD, 1_000));
     assert!(
-        !e.take_low_latency_request(PAD),
-        "同一条链路不该重复请求"
+        !e.take_low_latency_request(
+            PAD,
+            1_000 + LOW_LATENCY_REFRESH_MS - 1
+        ),
+        "间隔没到不该重发"
     );
 
     e.on_connection_change(PAD, false, 2_000);
     e.on_connection_change(PAD, true, 3_000);
     assert!(
-        e.take_low_latency_request(PAD),
-        "重连后要重新请求"
+        e.take_low_latency_request(PAD, 3_000),
+        "重连后要立刻重新请求,不必等间隔"
+    );
+}
+
+#[test]
+fn low_latency_is_reasserted_so_the_supervision_timeout_stays_long()
+ {
+    // 手柄会在连上几秒后把监督超时从我们请求的 5000 毫秒改回它自己的 3000
+    // 毫秒(实测我们的设置只维持约 6.8 秒)。而判死线的位置直接决定掉线率:
+    // 实测抓到过 2858 毫秒的停顿,距 3000 毫秒只差 142 毫秒。所以要定期把它
+    // 顶回去,而不是每条链路只争取一次。
+    let mut e = armed_engine();
+    e.on_connection_change(PAD, true, 1_000);
+    assert!(e.take_low_latency_request(PAD, 1_000));
+    assert!(
+        e.take_low_latency_request(
+            PAD,
+            1_000 + LOW_LATENCY_REFRESH_MS
+        ),
+        "间隔到了就该重申"
     );
 }
 
@@ -241,7 +264,7 @@ fn unarmed_device_keeps_its_own_connection_parameters() {
     // 双方的功耗,不是我们该替鼠标做的决定。
     let mut e = armed_engine();
     e.on_connection_change(MOUSE, true, 1_000);
-    assert!(!e.take_low_latency_request(MOUSE));
+    assert!(!e.take_low_latency_request(MOUSE, 1_000));
 }
 
 #[test]
@@ -721,11 +744,11 @@ fn low_latency_permit_comes_back_when_the_request_fails() {
     // 链路再没有第二次机会。
     let mut e = armed_engine();
     e.on_connection_change(PAD, true, 1_000);
-    assert!(e.take_low_latency_request(PAD));
+    assert!(e.take_low_latency_request(PAD, 1_000));
     e.return_low_latency_permit(PAD);
     assert!(
-        e.take_low_latency_request(PAD),
-        "失败后应当还能再领一次"
+        e.take_low_latency_request(PAD, 1_000),
+        "失败后应当立刻能再领一次,不必等间隔"
     );
 }
 

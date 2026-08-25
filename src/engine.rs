@@ -40,6 +40,25 @@ pub const FAST_SCAN_MS: u64 = 120_000;
 /// 手柄闲置一段时间会自行休眠,那是它固件里的计时器,平板改不了。能试的只有
 /// 一件事:往手柄发点数据,看它的固件认不认这算「有活动」。认不认查不到资料,
 /// 只能实测,所以这是个实验而非确定的修复。一分钟一次足够试探,再密只是白耗电。
+/// 两次重申低延迟连接参数之间的间隔。
+///
+/// 不是「每条链路一次」而是定期重申,理由是手柄会把监督超时抢回去。我们请求
+/// 高优先级时链路是 `timeout=500`(5000 毫秒),手柄随后请求它自己的
+/// `timeout=300`(3000 毫秒),系统照办 —— 实测我们的设置只维持约 6.8 秒。
+///
+/// 而判死线的位置直接决定掉线率:链路会反复停顿,大多数自己缓过来,所谓掉线
+/// 只是某次停顿越过了监督超时。实测抓到过 2858 毫秒的停顿,距 3000 毫秒只差
+/// 142 毫秒。把超时顶回 5 秒,这类停顿就连风险都算不上。
+///
+/// 取值是两难的折中:间隔越短,超时停在 5 秒的时间占比越高,但每次参数更新都
+/// 要双方在一个约定时刻同步切换,是实打实的空口开销。
+///
+/// 注意实际节奏由巡检周期量化 —— 巡检 10 秒一轮,所以这里取 15 秒时,真实的
+/// 重申间隔是 20 秒。手柄约 7 秒抢回一次,于是超时停在 5 秒的时间占比约三分之一。
+/// 这是保守的第一步:先看「越过 3 秒但存活」的停顿计数有没有变化,不够再往下调。
+/// 要更高的占比就得把这个值降到 10 秒以内(即每轮巡检都重申)。
+pub const LOW_LATENCY_REFRESH_MS: u64 = 15_000;
+
 pub const KEEPALIVE_GAP_MS: u64 = 60_000;
 
 /// 保活开着。
@@ -114,7 +133,8 @@ pub struct Engine {
     /// 各设备开始「等着它回来」的时刻:布防那一刻,或失去连接那一刻。
     waiting_since: HashMap<String, u64>,
     /// 本次链路已经发过低延迟请求的设备。断开即清。
-    low_latency_sent: HashSet<String>,
+    /// 上次向各设备重申低延迟参数的时刻。
+    last_low_latency: HashMap<String, u64>,
     /// 平台说「这台不在已配对列表里」的设备。没有配对记录,连接无从谈起。
     unpaired: HashSet<String>,
     log: Vec<Entry>,
@@ -248,7 +268,7 @@ impl Engine {
     /// 许可在安卓那侧真正发出去之前就被领走了,那一侧失败的话不还回来,这条链路
     /// 就再没有第二次机会 —— 而低延迟正是这个工具的手感所系。
     pub fn return_low_latency_permit(&mut self, mac: &str) {
-        self.low_latency_sent.remove(mac);
+        self.last_low_latency.remove(mac);
     }
 
     /// 领取一次「把连接参数压到低延迟档」的许可。
@@ -262,13 +282,22 @@ impl Engine {
     pub fn take_low_latency_request(
         &mut self,
         mac: &str,
+        now_ms: u64,
     ) -> bool {
         if !(self.armed.contains(mac)
             && self.connected.contains(mac))
         {
             return false;
         }
-        self.low_latency_sent.insert(mac.to_string())
+        if let Some(last) = self.last_low_latency.get(mac)
+            && now_ms.saturating_sub(*last)
+                < LOW_LATENCY_REFRESH_MS
+        {
+            return false;
+        }
+        self.last_low_latency
+            .insert(mac.to_string(), now_ms);
+        true
     }
 
     /// 领取一次保活许可。到点且设备连着才给。
@@ -336,7 +365,7 @@ impl Engine {
                 .insert(mac.to_string(), now_ms);
         }
         // 链路没了,已发的低延迟请求也随之失效,下次连上要重新发。
-        self.low_latency_sent.remove(mac);
+        self.last_low_latency.remove(mac);
     }
 
     /// 连接状态变了(我们连上的,或链路断了)。

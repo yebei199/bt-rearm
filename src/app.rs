@@ -309,7 +309,9 @@ fn with_engine<T>(f: impl FnOnce(&mut Engine) -> T) -> T {
 
 /// 领到许可就请求把连接参数压到低延迟档。引擎保证每条链路只发一次。
 fn claim_low_latency(mac: &str) {
-    if !with_engine(|e| e.take_low_latency_request(mac)) {
+    if !with_engine(|e| {
+        e.take_low_latency_request(mac, now_ms())
+    }) {
         return;
     }
     // 许可是每条链路一次,安卓那侧没发出去就得还回来,否则这条链路再没机会。
