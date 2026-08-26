@@ -71,6 +71,9 @@ public final class Rearm {
 
     /** 上一次弹出的正文,用来避免同一句话反复打扰。 */
     private static String lastAttention = "";
+
+    /** HCI 0x13:远端用户主动终止连接。手柄关机或闲置休眠走的就是这个。 */
+    private static final int REMOTE_TERMINATED = 0x13;
     /** 当前挂着的 GATT 客户端,按 MAC 存,断开时释放。 */
     private static final Map<String, BluetoothGatt> gatts = new HashMap<>();
     /** 每台设备用于保活的可读特征,服务发现完成后确定。 */
@@ -125,7 +128,13 @@ public final class Rearm {
                 // 只认非零状态:0 是我们自己关的客户端,链路未必有事;8(监督
                 // 超时)这类才是链路真的没了。报错了也不怕,巡检每十秒拿平台的
                 // 权威状态兜一次底。
-                if (status != BluetoothGatt.GATT_SUCCESS) {
+                //
+                // 0x13 要单独拎出来:那是对方主动终止(关机或闲置休眠),不是
+                // 链路失效。对它硬发连接只会换来一串连不上的尝试。
+                if (status == REMOTE_TERMINATED) {
+                    log("对方主动断开 " + mac);
+                    nativeOnPeerLeft(mac);
+                } else if (status != BluetoothGatt.GATT_SUCCESS) {
                     log("链路断开 " + mac + " 状态 " + status);
                     nativeOnConnectionChange(mac, false);
                 }
@@ -618,6 +627,8 @@ public final class Rearm {
     private static native void nativeOnScanFailed();
 
     private static native void nativeOnUnpaired(String mac);
+
+    private static native void nativeOnPeerLeft(String mac);
 
     /**
      * 往应用内日志写一行,同时抄一份进 logcat。

@@ -892,3 +892,32 @@ fn a_real_link_loss_still_resets_the_backoff() {
         "真的掉线之后要立刻重试"
     );
 }
+
+#[test]
+fn a_polite_goodbye_is_not_treated_as_a_link_failure() {
+    // 手柄主动终止链路(HCI 0x13)和链路失效(0x08)是两回事:前者是它说
+    // 「我要走了」—— 关机或闲置休眠。这时候硬把它拉回来,只会得到一串连不上的
+    // 尝试,还跟它的休眠逻辑对着干。等它自己回来广播即可。
+    let mut e = armed_engine();
+    e.on_connection_change(PAD, true, 1_000);
+    e.on_peer_left(PAD, 2_000);
+
+    assert_eq!(
+        e.on_tick(PAD, false, 2_000 + BLIND_GAP_MAX_MS),
+        Action::Skip("对方主动断开"),
+        "对方说了再见就别再盲试"
+    );
+}
+
+#[test]
+fn a_device_that_comes_back_is_picked_up_again() {
+    // 但「不主动拉」不等于「不管了」:它一广播就说明醒了,照常接管。
+    let mut e = armed_engine();
+    e.on_connection_change(PAD, true, 1_000);
+    e.on_peer_left(PAD, 2_000);
+    assert_eq!(
+        e.on_advertisement(PAD, false, 3_000),
+        Action::Connect,
+        "它自己回来了就要接住"
+    );
+}

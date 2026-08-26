@@ -137,6 +137,8 @@ pub struct Engine {
     last_low_latency: HashMap<String, u64>,
     /// 平台说「这台不在已配对列表里」的设备。没有配对记录,连接无从谈起。
     unpaired: HashSet<String>,
+    /// 自己主动终止了链路的设备(关机或闲置休眠)。别去硬拉,等它回来广播。
+    said_goodbye: HashSet<String>,
     log: Vec<Entry>,
 }
 
@@ -209,6 +211,8 @@ impl Engine {
         }
         // 收到广播意味着设备真的在:退避是为了应付设备不在,不能让它拖慢
         // 设备回来那一刻的反应。
+        // 它又开口了,说明醒着 —— 之前那声再见作废。
+        self.said_goodbye.remove(mac);
         self.blind_gap.remove(mac);
         // 上一次尝试还在窗口内:连接建立本身要几秒,别把它打断。
         if let Some(last) = self.last_try.get(mac)
@@ -236,6 +240,12 @@ impl Engine {
             return Action::Skip("未布防");
         }
         self.sync_connected(mac, system_connected, now_ms);
+        // 对方说过再见就别盲试 —— 它醒了会自己广播。
+        if self.said_goodbye.contains(mac)
+            && !self.connected.contains(mac)
+        {
+            return Action::Skip("对方主动断开");
+        }
         if self.connected.contains(mac) {
             self.blind_gap.remove(mac);
             self.note(
@@ -387,6 +397,7 @@ impl Engine {
         let was_connected = self.connected.contains(mac);
         self.sync_connected(mac, connected, now_ms);
         if connected {
+            self.said_goodbye.remove(mac);
             self.blind_gap.remove(mac);
             self.note(now_ms, format!("{mac} 已连接"));
         } else if was_connected {
@@ -503,6 +514,22 @@ impl Engine {
     /// 这台设备当前有没有配对记录。安卓那侧据此决定要不要去问平台。
     pub fn is_unpaired(&self, mac: &str) -> bool {
         self.unpaired.contains(mac)
+    }
+
+    /// 对方主动终止了链路(HCI 0x13),不是链路失效。
+    ///
+    /// 这两件事在安卓那侧的回调里只差一个状态码,含义却相反:0x08 是链路断了、
+    /// 设备多半还在,该立刻抢回来;0x13 是它说「我要走了」—— 关机或闲置休眠。
+    /// 对后者硬发连接,只会换来一串连不上的尝试,还跟它自己的休眠逻辑对着干。
+    ///
+    /// 记下来只是为了停掉盲试。它一旦重新广播就说明醒了,照常接管。
+    pub fn on_peer_left(&mut self, mac: &str, now_ms: u64) {
+        self.said_goodbye.insert(mac.to_string());
+        self.on_connection_change(mac, false, now_ms);
+        self.note(
+            now_ms,
+            format!("{mac} 主动断开,等它自己回来"),
+        );
     }
 
     /// 当前布防名单,给存盘用。

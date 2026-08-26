@@ -552,6 +552,24 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnConnectionC
 }
 
 /// Java 侧的异常与失败,原样进日志给用户看。
+/// 对方主动终止了链路(HCI 0x13),不是链路失效。
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnPeerLeft<
+    'c,
+>(
+    mut env: jni::EnvUnowned<'c>,
+    _class: jni::objects::JClass<'c>,
+    mac: jni::objects::JString<'c>,
+) {
+    env.with_env(|env| -> jni::errors::Result<()> {
+        let mac = mac.try_to_string(env)?;
+        with_engine(|e| e.on_peer_left(&mac, now_ms()));
+        update_scan();
+        Ok(())
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
+}
+
 /// 平台说这台设备已经不在配对列表里了。
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnUnpaired<
