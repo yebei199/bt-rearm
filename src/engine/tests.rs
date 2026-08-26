@@ -857,3 +857,38 @@ fn pairing_again_puts_the_device_back_to_work() {
         Scan::Start { .. }
     ));
 }
+
+#[test]
+fn a_failed_attempt_does_not_reset_the_backoff() {
+    // 一次失败的连接尝试,和一次真实的链路断开,在安卓那侧长得一模一样:
+    // 都是 DISCONNECTED 加一个非零状态码。若都当成「断开」去清退避,指数退避
+    // 就永远长不起来 —— 实测手柄关机后,应用以 30 秒一轮的固定节奏无休止重试,
+    // 正是注释里「关一夜近三千次无效尝试」想防住却没防住的那种情况。
+    let mut e = armed_engine();
+    let t = BLIND_GAP_MS;
+    assert_eq!(e.on_tick(PAD, false, t), Action::Connect);
+
+    // 这一次尝试失败了 —— 从头到尾没连上过。
+    e.on_connection_change(PAD, false, t + 1);
+
+    assert_eq!(
+        e.on_tick(PAD, false, t + 15_000),
+        Action::Skip("退避中"),
+        "失败的尝试不该把退避清零"
+    );
+}
+
+#[test]
+fn a_real_link_loss_still_resets_the_backoff() {
+    // 上面那条修复不能误伤真掉线:设备刚掉线时多半还在(掉线而非关机),
+    // 立刻积极重试正是这个工具存在的意义。
+    let mut e = armed_engine();
+    e.on_tick(PAD, false, BLIND_GAP_MS);
+    e.on_connection_change(PAD, true, 11_000);
+    e.on_connection_change(PAD, false, 12_000);
+    assert_eq!(
+        e.on_tick(PAD, false, 12_001),
+        Action::Connect,
+        "真的掉线之后要立刻重试"
+    );
+}

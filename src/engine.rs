@@ -381,19 +381,30 @@ impl Engine {
         } else {
             self.acl_since.remove(mac);
         }
+        // 安卓那侧无法区分「链路断了」和「这次连接没连上」—— 两者都是
+        // DISCONNECTED 加一个非零状态码。能区分的只有我们自己:先前认不认为
+        // 它是连着的。
+        let was_connected = self.connected.contains(mac);
         self.sync_connected(mac, connected, now_ms);
         if connected {
             self.blind_gap.remove(mac);
             self.note(now_ms, format!("{mac} 已连接"));
-        } else {
-            // 断开即清节流:下一条广播要能立刻接管,不必再等窗口 ——
-            // 这正是这个工具存在的意义。
+        } else if was_connected {
+            // 真的掉线:清节流,下一条广播要能立刻接管,不必再等窗口 ——
+            // 这正是这个工具存在的意义。刚掉线时设备多半还在(掉线而非关机),
+            // 值得积极重试一次。
             self.last_try.remove(mac);
-            // 刚断开时设备多半还在(掉线而非关机),值得积极重试一次。
             self.blind_gap.remove(mac);
             self.note(
                 now_ms,
                 format!("{mac} 断开,等待广播"),
+            );
+        } else {
+            // 这次尝试没连上。退避必须照常翻倍 —— 清零的话,手柄关机时会以
+            // 最高频率无休止重试。实测过这个后果:30 秒一轮,直到手柄电池耗尽。
+            self.note(
+                now_ms,
+                format!("{mac} 连接未成功,继续退避"),
             );
         }
     }
