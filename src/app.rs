@@ -419,20 +419,20 @@ fn resync_and_scan() {
             e.on_connection_change(&mac, connected, now)
         });
         // 应用启动时设备可能已经连着,那一刻不会再有连接广播,这里补一次。
-        tune_if_armed(&mac, connected);
+        watch_if_armed(&mac, connected);
     }
     apply(with_engine(|e| e.scan_command(now_ms())));
 }
 
 /// 布防设备一连上就把监督超时拉长;只管布防的,别动鼠标的链路。
 /// 判断「布防没有」是引擎的事,执行在 Java 那侧的 shell 进程里。
-fn tune_if_armed(mac: &str, connected: bool) {
+fn watch_if_armed(mac: &str, connected: bool) {
     if connected
         && with_engine(|e| {
             e.armed_macs().iter().any(|m| m == mac)
         })
     {
-        call_with_str!("tuneLink", mac);
+        call_with_str!("watchLink", mac);
     }
 }
 
@@ -461,9 +461,9 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeTick<
                 }
             }
             let connected = call_is_connected(&mac);
-            // 启动时特权服务多半还没绑上,挂客户端会落空;巡检补一次,
+            // 启动时特权服务多半还没绑上,挂观察客户端会落空;巡检补一次,
             // Java 那侧记得哪些已经挂好,不会重复。
-            tune_if_armed(&mac, connected);
+            watch_if_armed(&mac, connected);
             let action = with_engine(|e| {
                 e.on_tick(&mac, connected, now)
             });
@@ -540,7 +540,7 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnConnectionC
         // 连上就停扫、断开就复扫。扫描与已建立的连接共用射频,连着还扫会挤掉
         // 手柄的输入包 —— 卡手与 0x08 监督超时断线都由此而来。
         update_scan();
-        tune_if_armed(&mac, connected);
+        watch_if_armed(&mac, connected);
         Ok(())
     })
     .resolve::<jni::errors::LogErrorAndDefault>()

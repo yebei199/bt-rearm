@@ -434,23 +434,21 @@ public final class Rearm {
     }
 
     /**
-     * 布防设备连上之后,把监督超时拉长。
+     * 布防设备连上之后,在 shell 进程里给这条链路挂一个观察客户端。
      *
-     * <p>掉线的形态是平板突然收不到手柄的包,而手柄那边一直听得见平板(见 README
-     * 「空口抓包」一节)。只要平板的接收在几秒内恢复,把判死线放到 20 秒就能让链路
-     * 扛过那段静默,游戏里表现为卡一下而不是断开重连。安卓公开接口最多给 5 秒,
-     * 更长的要走 shell 进程里的隐藏接口。这是实验:静默到底多长没人知道,现有
-     * 数据只知道超过 5 秒。
+     * <p>它只做一件事:记下断开时的 HCI 原因码。这台 ROM 的 ACL 断开广播里没有
+     * 原因码字段(查过 Bluetooth.apk 的字符串),而 0x13「对方主动断开」与 0x08
+     * 「链路失效」要反着处理,分不出来就会对着一台想休息的手柄硬拉。
      */
-    public static void tuneLink(String mac) {
+    public static void watchLink(String mac) {
         synchronized (tuned) {
             if (tuned.contains(mac)) return;
         }
-        String line = Privileged.tuneLink(mac);
+        String line = Privileged.watchLink(mac);
         // 服务还没绑上就先不记,下一轮巡检再来;这正是启动那几秒的情形。
         if (line == null) return;
         log(line);
-        if (line.startsWith("已挂") || line.startsWith("链路参数客户端已挂着")) {
+        if (line.startsWith("已挂") || line.startsWith("链路观察客户端已挂着")) {
             synchronized (tuned) {
                 tuned.add(mac);
             }

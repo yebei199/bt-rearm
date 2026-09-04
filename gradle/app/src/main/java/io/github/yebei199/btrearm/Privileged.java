@@ -22,7 +22,7 @@ import rikka.shizuku.Shizuku;
 final class Privileged {
 
     /** 用户服务版本号,改了服务实现要加一,否则 Shizuku 会复用旧进程。 */
-    private static final int SERVICE_VERSION = 2;
+    private static final int SERVICE_VERSION = 3;
 
     private static final int PERMISSION_REQUEST_CODE = 2;
 
@@ -136,14 +136,14 @@ final class Privileged {
         }
     }
 
-    /** 往已建好的链路上挂观察客户端并拉长监督超时。服务未就绪返回 null。 */
-    static String tuneLink(String mac) {
+    /** 往已建好的链路上挂观察客户端,只为记录断开原因码。服务未就绪返回 null。 */
+    static String watchLink(String mac) {
         IPrivilegedConnect s = service;
         if (s == null) return null;
         try {
-            return s.tuneLink(mac);
+            return s.watchLink(mac);
         } catch (Exception e) {
-            return "挂链路参数客户端失败: " + e;
+            return "挂链路观察客户端失败: " + e;
         }
     }
 

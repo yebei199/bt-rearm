@@ -41,14 +41,6 @@ public final class PrivilegedConnect extends IPrivilegedConnect.Stub {
     /** 单次连接调用的等待上限,超时即认为系统没响应。 */
     private static final long CALL_TIMEOUT_SECONDS = 10;
 
-    /**
-     * 拉长监督超时时请求的链路参数。间隔与从属延迟照抄手柄自己要的
-     * (11.25 ms、1),只把超时从它要的 3 秒改成 20 秒(单位 10 ms)。改得越少,
-     * 手柄越没理由再把参数抢回去;抢不抢回去,由 btsnoop 说了算。
-     */
-    private static final int CONN_INTERVAL_UNITS = 9;
-    private static final int PERIPHERAL_LATENCY = 1;
-    private static final int SUPERVISION_TIMEOUT_UNITS = 2000;
     private static final int TRANSPORT_LE = BluetoothDevice.TRANSPORT_LE;
     private static final int PHY_1M_MASK = BluetoothDevice.PHY_LE_1M_MASK;
 
@@ -101,15 +93,15 @@ public final class PrivilegedConnect extends IPrivilegedConnect.Stub {
     }
 
     @Override
-    public String tuneLink(String mac) {
+    public String watchLink(String mac) {
         BlockingQueue<String> result = new ArrayBlockingQueue<>(1);
-        worker.post(() -> result.offer(tuneOnWorker(mac)));
+        worker.post(() -> result.offer(watchOnWorker(mac)));
         try {
             String line = result.poll(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            return line == null ? "挂链路参数客户端超时 " + mac : line;
+            return line == null ? "挂链路观察客户端超时 " + mac : line;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return "挂链路参数客户端被打断 " + mac;
+            return "挂链路观察客户端被打断 " + mac;
         }
     }
 
@@ -122,7 +114,7 @@ public final class PrivilegedConnect extends IPrivilegedConnect.Stub {
     }
 
     /**
-     * 往已建好的链路上挂一个 GATT 客户端。
+     * 往已建好的链路上挂一个只读的观察客户端,唯一的用途是拿到断开原因码。
      *
      * <p>公开的 {@code connectGatt} 在这个进程里走不通:它内部取的是框架注册表里的
      * 默认适配器,而这里的注册表是空的。于是反射构造 {@link BluetoothGatt},用我们
@@ -132,12 +124,12 @@ public final class PrivilegedConnect extends IPrivilegedConnect.Stub {
      * <p>设备对象从已配对列表取,不用 {@code getRemoteDevice(mac)}:后者的地址类型
      * 是 public,而手柄用随机静态地址,类型不符的连接请求发给的是一个不存在的设备。
      */
-    private String tuneOnWorker(String mac) {
+    private String watchOnWorker(String mac) {
         try {
             if (adapter == null) {
                 adapter = buildAdapter();
             }
-            if (gatts.containsKey(mac)) return "链路参数客户端已挂着 " + mac;
+            if (gatts.containsKey(mac)) return "链路观察客户端已挂着 " + mac;
             BluetoothDevice device = null;
             for (BluetoothDevice d : adapter.getBondedDevices()) {
                 if (d.getAddress().equals(mac)) device = d;
@@ -155,16 +147,22 @@ public final class PrivilegedConnect extends IPrivilegedConnect.Stub {
                     "connect", Boolean.class, BluetoothGattCallback.class, Handler.class);
             connect.setAccessible(true);
             Object ok = connect.invoke(gatt, Boolean.FALSE, new LinkWatcher(mac), worker);
-            if (!Boolean.TRUE.equals(ok)) return "挂链路参数客户端被拒 " + mac;
+            if (!Boolean.TRUE.equals(ok)) return "挂链路观察客户端被拒 " + mac;
             gatts.put(mac, gatt);
-            return "已挂链路参数客户端 " + mac;
+            return "已挂链路观察客户端 " + mac;
         } catch (Throwable t) {
             Throwable cause = t.getCause() == null ? t : t.getCause();
-            return "挂链路参数客户端失败 " + mac + ": " + cause;
+            return "挂链路观察客户端失败 " + mac + ": " + cause;
         }
     }
 
-    /** 附着在链路上:连上就改参数,断开就记原因、关客户端。 */
+    /**
+     * 附着在链路上,只为记下断开原因码。
+     *
+     * <p>不碰任何链路参数。曾经在这里把监督超时顶到 20 秒,想让链路扛过静默;
+     * 09-05 的抓包证明静默超过 21.8 秒,判死线放到 20 秒照样死,而线越长每次掉线
+     * 反而等得越久 —— 手柄要等主机判死之后再过一个超时才重新广播。已撤。
+     */
     private final class LinkWatcher extends BluetoothGattCallback {
         private final String mac;
 
@@ -175,11 +173,10 @@ public final class PrivilegedConnect extends IPrivilegedConnect.Stub {
         @Override
         public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                android.util.Log.i("btrearm", "链路参数客户端已附着 " + mac + " 状态 " + status);
-                requestLongTimeout(g);
+                android.util.Log.i("btrearm", "链路观察客户端已附着 " + mac + " 状态 " + status);
                 return;
             }
-            android.util.Log.i("btrearm", "链路参数客户端断开 " + mac + " 状态 " + status);
+            android.util.Log.i("btrearm", "链路观察客户端断开 " + mac + " 状态 " + status);
             synchronized (lastReason) {
                 lastReason.put(mac, status);
             }
@@ -189,19 +186,6 @@ public final class PrivilegedConnect extends IPrivilegedConnect.Stub {
                 } catch (SecurityException e) {
                     // 关不掉也不影响下一次重挂。
                 }
-            }
-        }
-
-        private void requestLongTimeout(BluetoothGatt g) {
-            try {
-                Method update = BluetoothGatt.class.getMethod("requestLeConnectionUpdate",
-                        int.class, int.class, int.class, int.class, int.class, int.class);
-                Object accepted = update.invoke(g, CONN_INTERVAL_UNITS, CONN_INTERVAL_UNITS,
-                        PERIPHERAL_LATENCY, SUPERVISION_TIMEOUT_UNITS, 0, 0);
-                android.util.Log.i("btrearm", "已请求 20 秒监督超时 " + mac + " 受理=" + accepted);
-            } catch (Throwable t) {
-                Throwable cause = t.getCause() == null ? t : t.getCause();
-                android.util.Log.i("btrearm", "请求监督超时失败 " + mac + ": " + cause);
             }
         }
     }

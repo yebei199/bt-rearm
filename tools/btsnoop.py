@@ -9,7 +9,9 @@
 文件按时间从早到晚传(编号大的更早,不带编号的最新)。只依赖标准库。
 只认 H4 格式(安卓就是这个),时间戳按本地时间原样显示,安卓写进去的已经是本地时间。
 
-输出三段:
+输出四段:
+  0. 掉线率:在用时长、掉线次数、平均每几分钟一次。改一个环境变量玩一局跑一次,
+     拿这个数字前后对比 —— 单看某一局撑了多久没有意义,见该段末尾的说明。
   1. 链路事件:建链、参数更新、断开(附断开前平板最后一次收到对方包距今多久)、
      断开之后第一条来自对方的广播报告。
   2. 收包停顿:连着时两次收到对方 ACL 数据包之间 ≥ 300 ms 的间隔。注意这只看 HCI
@@ -30,6 +32,10 @@ Drop = list  # [最后收包时刻, 断开时刻, 重连时刻或 None, handle]
 EPOCH_OFF = 0x00DCDDB30F2F8000  # 公元 0 年到 1970 年之间的微秒数
 GAP_MS = 300.0
 WINDOW_S = 12.0
+# 低于这个包速率就当手柄闲置:它靠 slave latency 跳过连接事件,不发包就丢无可丢。
+ACTIVE_PPS = 10.0
+# 太短的链路多半是连接建立失败的残骸,不进掉线率统计。
+MIN_SPAN_S = 20.0
 
 
 def ts(us: int) -> datetime.datetime:
@@ -169,6 +175,71 @@ def drop_windows(pk: list[Record], peer: bytes, drops: list[Drop]) -> None:
         print(f'  它的首条广播: {first}')
 
 
+def connections(
+    pk: list[Record], peer: bytes
+) -> list[tuple[float, float, int]]:
+    """每条链路的 (存活秒数, 平均每秒收到的包数, 断开原因码)。"""
+    rows = []
+    handle = None
+    t0 = None
+    rx = 0
+    for t, flags, d in pk:
+        if not d:
+            continue
+        meta = le_meta(d)
+        if meta and conn_complete(meta[1], peer):
+            handle, t0, rx = conn_complete(meta[1], peer)[0], t, 0
+        elif d[0] == 4 and d[1] == 0x05 and handle is not None:
+            p = d[3 : 3 + d[2]]
+            if (struct.unpack('<H', p[1:3])[0] & 0x0FFF) == handle:
+                dur = (t - t0) / 1e6
+                if dur > 0:
+                    rows.append((dur, rx / dur, p[3]))
+                handle = None
+        elif (
+            d[0] == 2
+            and handle is not None
+            and flags & 1
+            and acl_handle(d) == handle
+        ):
+            rx += 1
+    return rows
+
+
+def drop_rate(pk: list[Record], peer: bytes) -> None:
+    """一次采集的掉线率。改一个环境变量、玩一局、跑一次,拿这几个数字前后对比。
+
+    只统计「在用」的链路。手柄闲置时靠 slave latency 跳过连接事件,几乎不发包,
+    丢无可丢,存活时间自然长;把闲置时段算进去会把掉线率稀释成没法比较的数字。
+    """
+    active = [
+        r
+        for r in connections(pk, peer)
+        if r[1] >= ACTIVE_PPS and r[0] >= MIN_SPAN_S
+    ]
+    if not active:
+        print(
+            f'没有包速率达到 {ACTIVE_PPS}/秒的链路,这份采集里手柄没有被真正使用。'
+        )
+        return
+    spans = sorted(r[0] for r in active)
+    total = sum(spans)
+    lost = sum(1 for r in active if r[2] == 0x08)
+    print(f'在用时长合计 {total / 60:.1f} 分钟,分布在 {len(active)} 条链路上')
+    print(f'监督超时掉线 {lost} 次', end='')
+    print(f',平均每 {total / 60 / lost:.1f} 分钟一次' if lost else '')
+    print(
+        '每条链路的存活秒数(从短到长): ' + ' '.join(f'{s:.0f}' for s in spans)
+    )
+    mean = total / len(spans)
+    sd = (sum((s - mean) ** 2 for s in spans) / max(len(spans) - 1, 1)) ** 0.5
+    print(f'平均 {mean:.0f} s,标准差 {sd:.0f} s')
+    print(
+        '标准差接近平均值说明掉线是无记忆的随机过程:单局撑得久只是运气,\n'
+        '要判断某个改动有没有用,只能比上面那个「平均每几分钟一次」。'
+    )
+
+
 def main(argv: list[str]) -> None:
     if len(argv) < 3:
         sys.exit(__doc__)
@@ -179,6 +250,8 @@ def main(argv: list[str]) -> None:
         f'{len(pk)} 条记录  {ts(pk[0][0]):%m-%d %H:%M:%S} → {ts(pk[-1][0]):%m-%d %H:%M:%S}'
     )
     events, gaps, drops = timeline(pk, peer)
+    print('\n=== 掉线率 ===')
+    drop_rate(pk, peer)
     print('\n=== 链路事件 ===')
     for t, s in events:
         print(f'{ts(t):%H:%M:%S.%f} {s}')

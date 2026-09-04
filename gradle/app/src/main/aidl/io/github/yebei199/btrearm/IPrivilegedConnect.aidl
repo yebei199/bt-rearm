@@ -18,12 +18,11 @@ interface IPrivilegedConnect {
     String connect(String mac) = 1;
 
     /**
-     * 往这台设备已经建好的链路上挂一个观察用的 GATT 客户端,连上就把监督超时拉长,
-     * 断开时记下原因码。
+     * 往这台设备已经建好的链路上挂一个只读的观察客户端,断开时记下原因码。
      *
      * @return 一行结果,原样进界面日志
      */
-    String tuneLink(String mac) = 2;
+    String watchLink(String mac) = 2;
 
     /**
      * 上一次断开的 HCI 原因码(取走即清),没记录时返回 -1。
