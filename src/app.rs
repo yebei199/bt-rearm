@@ -307,19 +307,6 @@ fn with_engine<T>(f: impl FnOnce(&mut Engine) -> T) -> T {
     f(engine)
 }
 
-/// 领到许可就请求把连接参数压到低延迟档。引擎保证每条链路只发一次。
-fn claim_low_latency(mac: &str) {
-    if !with_engine(|e| {
-        e.take_low_latency_request(mac, now_ms())
-    }) {
-        return;
-    }
-    // 许可是每条链路一次,安卓那侧没发出去就得还回来,否则这条链路再没机会。
-    if !call_str_bool!("requestLowLatency", mac) {
-        with_engine(|e| e.return_low_latency_permit(mac));
-    }
-}
-
 /// 目标扫描状态变了才下发。每个事件都重下的话,安卓侧会不停停扫再开扫,
 /// 那本身就是一次射频扰动。
 fn update_scan() {
@@ -468,13 +455,6 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeTick<
                 update_scan();
                 call_connect(&mac);
             }
-            // 应用启动时设备可能已经连着,那一刻不会再有连接广播 —— 巡检补发。
-            claim_low_latency(&mac);
-            // 保活:试探手柄固件认不认平板发来的数据算「有活动」,从而推迟休眠。
-            if with_engine(|e| e.take_keepalive(&mac, now))
-            {
-                call_with_str!("keepAlive", &mac);
-            }
         }
         // 扫描目标只跟整份名单有关,一轮巡检结算一次就够,不必每台设备算一遍。
         update_scan();
@@ -516,7 +496,6 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnAdvertiseme
         if action == Action::Connect {
             call_connect(&mac);
         }
-        claim_low_latency(&mac);
         Ok(())
     })
     .resolve::<jni::errors::LogErrorAndDefault>()
@@ -544,8 +523,6 @@ pub extern "system" fn Java_io_github_yebei199_btrearm_Rearm_nativeOnConnectionC
         // 连上就停扫、断开就复扫。扫描与已建立的连接共用射频,连着还扫会挤掉
         // 手柄的输入包 —— 卡手与 0x08 监督超时断线都由此而来。
         update_scan();
-        // 刚建的链路用的是保守的连接参数,手感要等几秒才好。主动去压。
-        claim_low_latency(&mac);
         Ok(())
     })
     .resolve::<jni::errors::LogErrorAndDefault>()

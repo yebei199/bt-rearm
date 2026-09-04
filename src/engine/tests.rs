@@ -2,8 +2,6 @@
 
 use super::*;
 
-use super::*;
-
 const PAD: &str = "C5:C5:30:98:47:5C";
 const MOUSE: &str = "AA:BB:CC:DD:76:20";
 
@@ -203,71 +201,6 @@ fn log_is_capped() {
 }
 
 #[test]
-fn connected_armed_device_wants_low_latency() {
-    // 系统建链时用的是保守的连接参数,输入延迟明显偏高,实测要等几秒才
-    // 自行变好(推测是游戏或系统随后请求了高优先级)。布防的设备一连上
-    // 就该由我们主动去压,而不是让用户等。
-    let mut e = armed_engine();
-    assert!(
-        !e.take_low_latency_request(PAD, 0),
-        "还没连上时不该动参数"
-    );
-    e.on_connection_change(PAD, true, 1_000);
-    assert!(e.take_low_latency_request(PAD, 1_000));
-}
-
-#[test]
-fn low_latency_is_paced_not_spammed() {
-    // 刚发过就别再发:每次参数更新都要双方在一个约定时刻同步切换,连着刷
-    // 既无意义又是实打实的空口开销。
-    let mut e = armed_engine();
-    e.on_connection_change(PAD, true, 1_000);
-    assert!(e.take_low_latency_request(PAD, 1_000));
-    assert!(
-        !e.take_low_latency_request(
-            PAD,
-            1_000 + LOW_LATENCY_REFRESH_MS - 1
-        ),
-        "间隔没到不该重发"
-    );
-
-    e.on_connection_change(PAD, false, 2_000);
-    e.on_connection_change(PAD, true, 3_000);
-    assert!(
-        e.take_low_latency_request(PAD, 3_000),
-        "重连后要立刻重新请求,不必等间隔"
-    );
-}
-
-#[test]
-fn low_latency_is_reasserted_so_the_supervision_timeout_stays_long()
- {
-    // 手柄会在连上几秒后把监督超时从我们请求的 5000 毫秒改回它自己的 3000
-    // 毫秒(实测我们的设置只维持约 6.8 秒)。而判死线的位置直接决定掉线率:
-    // 实测抓到过 2858 毫秒的停顿,距 3000 毫秒只差 142 毫秒。所以要定期把它
-    // 顶回去,而不是每条链路只争取一次。
-    let mut e = armed_engine();
-    e.on_connection_change(PAD, true, 1_000);
-    assert!(e.take_low_latency_request(PAD, 1_000));
-    assert!(
-        e.take_low_latency_request(
-            PAD,
-            1_000 + LOW_LATENCY_REFRESH_MS
-        ),
-        "间隔到了就该重申"
-    );
-}
-
-#[test]
-fn unarmed_device_keeps_its_own_connection_parameters() {
-    // 没布防的设备是别人的链路,不该被我们改连接参数 —— 压低间隔要付出
-    // 双方的功耗,不是我们该替鼠标做的决定。
-    let mut e = armed_engine();
-    e.on_connection_change(MOUSE, true, 1_000);
-    assert!(!e.take_low_latency_request(MOUSE, 1_000));
-}
-
-#[test]
 fn scanning_runs_at_full_duty_right_after_a_drop() {
     // 省电扫描每 5120 毫秒只听 512 毫秒,九成时间听不见 —— 刚掉线那阵子
     // 人多半还在用,这几秒的等待要靠满占空比压掉。
@@ -300,30 +233,6 @@ fn scanning_falls_back_to_low_power_once_the_device_stays_away()
             fast: false
         })
     );
-}
-
-#[test]
-fn keepalive_is_paced_and_only_sent_while_connected() {
-    // 保活是发给「连着的手柄」的:没连上时发无处可发。节奏也要限住,
-    // 每分钟一次足够试探固件,再密只是白耗电。
-    let mut e = armed_engine();
-    assert!(!e.keepalive_due(PAD, 0), "没连上时不该发");
-
-    e.on_connection_change(PAD, true, 1_000);
-    assert!(e.keepalive_due(PAD, 1_000));
-    assert!(
-        !e.keepalive_due(PAD, 1_000 + KEEPALIVE_GAP_MS - 1),
-        "未到间隔不该重发"
-    );
-    assert!(e.keepalive_due(PAD, 1_000 + KEEPALIVE_GAP_MS));
-}
-
-#[test]
-fn keepalive_is_not_sent_to_unarmed_devices() {
-    // 没布防的设备不归我们管,别去打扰它的链路。
-    let mut e = armed_engine();
-    e.on_connection_change(MOUSE, true, 1_000);
-    assert!(!e.keepalive_due(MOUSE, 1_000));
 }
 
 #[test]
@@ -738,21 +647,6 @@ fn scan_is_reissued_after_the_platform_refuses_to_start_it()
 }
 
 #[test]
-fn low_latency_permit_comes_back_when_the_request_fails() {
-    // 许可是「每条链路只发一次」,可它在安卓那侧真正发出去之前就被收走了。
-    // 那一侧失败(设备不在配对列表、拿不到 GATT 客户端)许可就白烧,这条
-    // 链路再没有第二次机会。
-    let mut e = armed_engine();
-    e.on_connection_change(PAD, true, 1_000);
-    assert!(e.take_low_latency_request(PAD, 1_000));
-    e.return_low_latency_permit(PAD);
-    assert!(
-        e.take_low_latency_request(PAD, 1_000),
-        "失败后应当立刻能再领一次,不必等间隔"
-    );
-}
-
-#[test]
 fn scanning_pauses_while_a_connect_attempt_is_in_flight() {
     // 连接发出去之后的那几秒,收到的广播引擎一律按「连接中」跳过 —— 建链本身要
     // 几秒,不能被打断。既然这段时间的广播不会被采纳,扫描就是白扫,而它偏偏是
@@ -805,19 +699,6 @@ fn one_device_being_connected_does_not_blind_the_others() {
         }
         other => panic!("另一台还该扫: {other:?}"),
     }
-}
-
-#[test]
-fn keepalive_goes_out_when_the_switch_is_on() {
-    // 总开关与内层规则分开:开关一关,针对 take_keepalive 的用例就会全部变成
-    // 空转,节奏和适用范围哪天被改坏都看不出来。这个用例盯着两者的接合处。
-    let mut e = armed_engine();
-    e.on_connection_change(PAD, true, 1_000);
-    assert_eq!(
-        e.take_keepalive(PAD, 1_000),
-        KEEPALIVE_ENABLED,
-        "对外发不发,只取决于总开关"
-    );
 }
 
 #[test]

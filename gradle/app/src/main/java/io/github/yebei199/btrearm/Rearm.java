@@ -8,8 +8,6 @@ import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGatt;
 import android.bluetooth.BluetoothGattCallback;
-import android.bluetooth.BluetoothGattCharacteristic;
-import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothManager;
 import android.bluetooth.BluetoothProfile;
 import android.bluetooth.le.BluetoothLeScanner;
@@ -51,6 +49,11 @@ import java.util.UUID;
  *       {@link #bondedDevices}、{@link #isConnected}
  *   <li>Java → Rust:{@link #nativeOnAdvertisement}、{@link #nativeOnConnectionChange}
  * </ul>
+ *
+ * <p>连上之后这里什么都不做。曾经在链路上挂过自己的 GATT 客户端去压低连接参数、
+ * 定期读特征当保活,2026-09-04 的空口抓包证明两者都不救掉线:掉线是平板突然
+ * 收不到手柄的包,和链路参数无关;而把监督超时顶到 5 秒反而让每次掉线多等 4 秒
+ * 才接回(手柄要等平板判死之后再过一个超时才重新广播)。
  */
 public final class Rearm {
 
@@ -74,11 +77,14 @@ public final class Rearm {
 
     /** HCI 0x13:远端用户主动终止连接。手柄关机或闲置休眠走的就是这个。 */
     private static final int REMOTE_TERMINATED = 0x13;
-    /** 当前挂着的 GATT 客户端,按 MAC 存,断开时释放。 */
+    /**
+     * ACL 断开广播里带 HCI 原因码的字段。它是系统 API,SDK 里没有这个常量,
+     * 但读一个 Bundle 里的键不受隐藏 API 名单限制,所以按名字写死。
+     */
+    private static final String EXTRA_DISCONNECT_REASON =
+            "android.bluetooth.device.extra.DISCONNECT_REASON";
+    /** 退回自建链路时挂着的 GATT 客户端,按 MAC 存,断开时释放。 */
     private static final Map<String, BluetoothGatt> gatts = new HashMap<>();
-    /** 每台设备用于保活的可读特征,服务发现完成后确定。 */
-    private static final Map<String, BluetoothGattCharacteristic> keepaliveTarget =
-            new HashMap<>();
     private static boolean scanning;
     private static boolean ticking;
     /**
@@ -119,7 +125,6 @@ public final class Rearm {
             if (newState != BluetoothProfile.STATE_CONNECTED) {
                 synchronized (Rearm.class) {
                     closeQuietly(gatts.remove(mac));
-                    keepaliveTarget.remove(mac);
                 }
                 // 链路真断了的话,这条回调比 ACL 广播早半秒到 —— 实测断开时刻
                 // 27.383,回调 27.385,而广播驱动的开扫要等到 27.900。那半秒
@@ -140,42 +145,8 @@ public final class Rearm {
                 }
                 return;
             }
-            applyHighPriority(mac, g);
-            // 保活要往手柄发真实的空中数据,得先知道有哪些特征可读。
-            try {
-                g.discoverServices();
-            } catch (SecurityException e) {
-                log("服务发现失败: " + e);
-            }
+            // 连上就完事:参数、保活一概不碰,见类注释。
         }
-
-        @Override
-        public void onServicesDiscovered(BluetoothGatt g, int status) {
-            if (status != BluetoothGatt.GATT_SUCCESS) return;
-            String mac = g.getDevice().getAddress();
-            BluetoothGattCharacteristic pick = pickReadable(g);
-            if (pick == null) {
-                log("没有可用于保活的特征 " + mac);
-                return;
-            }
-            synchronized (Rearm.class) {
-                keepaliveTarget.put(mac, pick);
-            }
-        }
-
-        @Override
-        public void onCharacteristicRead(
-                BluetoothGatt g,
-                BluetoothGattCharacteristic c,
-                byte[] value,
-                int status) {
-            // 读成功即说明数据确实到手柄走了一圈,这正是保活想要的效果。
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                log("保活读取失败 " + g.getDevice().getAddress()
-                        + " 状态 " + status);
-            }
-        }
-
     };
 
     private static void closeQuietly(BluetoothGatt g) {
@@ -202,9 +173,19 @@ public final class Rearm {
                 log("服务发现完成 " + d.getAddress());
                 return;
             }
-            nativeOnConnectionChange(
-                    d.getAddress(),
-                    BluetoothDevice.ACTION_ACL_CONNECTED.equals(intent.getAction()));
+            if (BluetoothDevice.ACTION_ACL_CONNECTED.equals(intent.getAction())) {
+                nativeOnConnectionChange(d.getAddress(), true);
+                return;
+            }
+            // 系统接管的链路上我们没有自己的 GATT 回调,断开原因只能从广播的
+            // 附加字段里读。0x13 是对方主动终止(关机或闲置休眠),别去硬拉。
+            int reason = intent.getIntExtra(EXTRA_DISCONNECT_REASON, -1);
+            log("链路断开 " + d.getAddress() + " 原因 " + reason);
+            if (reason == REMOTE_TERMINATED) {
+                nativeOnPeerLeft(d.getAddress());
+            } else {
+                nativeOnConnectionChange(d.getAddress(), false);
+            }
         }
     };
 
@@ -295,9 +276,7 @@ public final class Rearm {
         String privileged = Privileged.connect(mac);
         if (privileged != null) {
             log(privileged);
-            // 系统接管了链路,但保活和读电量用的是我们自己的 GATT 客户端 ——
-            // 以前这里直接返回,那两件事便一直在空转。
-            ensureGatt(d);
+            // 系统接管了链路,我们就退出这条链路,不再往上挂任何自己的客户端。
             return;
         }
         // 借系统自己的策略逻辑来发起连接:PhonePolicy 监听 ACTION_UUID,一收到就
@@ -318,8 +297,7 @@ public final class Rearm {
     }
 
     /**
-     * 确保这台设备有一个我们自己的 GATT 客户端。保活与读电量都要用它,而系统
-     * 接管的那条 HID 链路是另一回事,借不到。
+     * 退回自建链路:给这台设备挂一个我们自己的 autoConnect GATT 客户端。
      *
      * <p>已经挂着的不重挂 —— 重建客户端会把系统的后台等待名单清掉。
      * connectGatt 返回 null 时不记账,否则那个空位会永远挡住重试。
@@ -334,99 +312,6 @@ public final class Rearm {
             } catch (SecurityException e) {
                 log("连接 " + mac + " 失败: " + e);
             }
-        }
-    }
-
-    /**
-     * 请求把链路的连接参数压到低延迟档。
-     *
-     * <p>连接间隔决定输入延迟。系统建链时用的是保守的默认参数,实测手柄要等
-     * 几秒才变跟手 —— 那几秒里是游戏或系统随后去请求了高优先级。我们主动请求,
-     * 把这段等待去掉。
-     *
-     * <p>连接参数是**整条链路**的属性,不是某个客户端私有的,所以我们这个 GATT
-     * 客户端提的请求同样作用于系统的 HID 链路。客户端要一直挂着:关掉之后栈可能
-     * 把参数恢复成默认档。注意它与扫描是两回事 —— 附在已有链路上的 GATT 客户端
-     * 不增加额外的射频占用,而扫描会。
-     *
-     * <p>要不要对某台设备做,由 Rust 引擎判断(只对布防中且已连上的设备做)。
-     */
-    /**
-     * 把这条链路的连接参数压到低延迟档。
-     *
-     * @return 请求是否真的发出去了。没发出去要让引擎把「每条链路一次」的许可
-     *     还回来,否则这条链路再没有第二次机会。
-     */
-    public static boolean requestLowLatency(String mac) {
-        BluetoothGatt existing;
-        synchronized (Rearm.class) {
-            existing = gatts.get(mac);
-        }
-        if (existing != null) return applyHighPriority(mac, existing);
-        BluetoothDevice d = bonded(mac);
-        if (d == null) {
-            log(mac + " 不在已配对列表里,没法压低延迟");
-            return false;
-        }
-        // 客户端还没建好,这一轮先把它拉起来;连上后回调里会自己提参数请求。
-        ensureGatt(d);
-        return false;
-    }
-
-    /**
-     * 挑一个可读、且不属于 HID 服务的特征作为保活目标。
-     *
-     * <p>避开 HID 服务(0x1812):安卓禁止普通应用访问它,读会抛 SecurityException。
-     * 设备信息服务里的型号、固件版本之类是只读常量,读它对手柄没有副作用。
-     */
-    private static BluetoothGattCharacteristic pickReadable(BluetoothGatt g) {
-        for (BluetoothGattService svc : g.getServices()) {
-            if (HID_SERVICE.equals(svc.getUuid())) continue;
-            for (BluetoothGattCharacteristic c : svc.getCharacteristics()) {
-                if ((c.getProperties() & BluetoothGattCharacteristic.PROPERTY_READ) != 0) {
-                    return c;
-                }
-            }
-        }
-        return null;
-    }
-
-    /**
-     * 往手柄发一次保活:读一个无副作用的特征。
-     *
-     * <p>手柄闲置会自行休眠,那是它固件里的计时器,平板改不了。唯一能试的是往它
-     * 发点数据,看固件认不认这算「有活动」—— 认不认查不到资料,只能实测,所以这
-     * 是实验性的。要不要发、多久发一次,由 Rust 引擎决定。
-     */
-    public static void keepAlive(String mac) {
-        BluetoothGatt g;
-        BluetoothGattCharacteristic target;
-        synchronized (Rearm.class) {
-            g = gatts.get(mac);
-            target = keepaliveTarget.get(mac);
-        }
-        if (g == null) {
-            BluetoothDevice d = bonded(mac);
-            if (d != null) ensureGatt(d);
-            return;
-        }
-        if (target == null) return;
-        try {
-            g.readCharacteristic(target);
-        } catch (SecurityException e) {
-            log("保活失败: " + e);
-        }
-    }
-
-    private static boolean applyHighPriority(String mac, BluetoothGatt g) {
-        try {
-            boolean accepted =
-                    g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH);
-            log((accepted ? "已请求低延迟 " : "低延迟请求被拒 ") + mac);
-            return accepted;
-        } catch (SecurityException e) {
-            log("请求低延迟失败: " + e);
-            return false;
         }
     }
 
