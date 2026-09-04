@@ -22,7 +22,7 @@ import rikka.shizuku.Shizuku;
 final class Privileged {
 
     /** 用户服务版本号,改了服务实现要加一,否则 Shizuku 会复用旧进程。 */
-    private static final int SERVICE_VERSION = 1;
+    private static final int SERVICE_VERSION = 2;
 
     private static final int PERMISSION_REQUEST_CODE = 2;
 
@@ -133,6 +133,28 @@ final class Privileged {
             service = null;
             binding = false;
             return "特权连接调用失败: " + e;
+        }
+    }
+
+    /** 往已建好的链路上挂观察客户端并拉长监督超时。服务未就绪返回 null。 */
+    static String tuneLink(String mac) {
+        IPrivilegedConnect s = service;
+        if (s == null) return null;
+        try {
+            return s.tuneLink(mac);
+        } catch (Exception e) {
+            return "挂链路参数客户端失败: " + e;
+        }
+    }
+
+    /** 上一次断开的 HCI 原因码;服务不在或没记录时为 -1。 */
+    static int lastDisconnectReason(String mac) {
+        IPrivilegedConnect s = service;
+        if (s == null) return -1;
+        try {
+            return s.lastDisconnectReason(mac);
+        } catch (Exception e) {
+            return -1;
         }
     }
 }

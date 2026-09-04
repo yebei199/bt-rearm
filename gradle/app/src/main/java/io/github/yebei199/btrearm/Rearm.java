@@ -77,12 +77,6 @@ public final class Rearm {
 
     /** HCI 0x13:远端用户主动终止连接。手柄关机或闲置休眠走的就是这个。 */
     private static final int REMOTE_TERMINATED = 0x13;
-    /**
-     * ACL 断开广播里带 HCI 原因码的字段。它是系统 API,SDK 里没有这个常量,
-     * 但读一个 Bundle 里的键不受隐藏 API 名单限制,所以按名字写死。
-     */
-    private static final String EXTRA_DISCONNECT_REASON =
-            "android.bluetooth.device.extra.DISCONNECT_REASON";
     /** 退回自建链路时挂着的 GATT 客户端,按 MAC 存,断开时释放。 */
     private static final Map<String, BluetoothGatt> gatts = new HashMap<>();
     private static boolean scanning;
@@ -177,9 +171,14 @@ public final class Rearm {
                 nativeOnConnectionChange(d.getAddress(), true);
                 return;
             }
-            // 系统接管的链路上我们没有自己的 GATT 回调,断开原因只能从广播的
-            // 附加字段里读。0x13 是对方主动终止(关机或闲置休眠),别去硬拉。
-            int reason = intent.getIntExtra(EXTRA_DISCONNECT_REASON, -1);
+            // 这台 ROM 的断开广播里没有原因码字段(查过 Bluetooth.apk,只有
+            // EXTRA_TRANSPORT)。原因码只有挂在链路上的 GATT 客户端看得到,那个
+            // 客户端在 shell 进程里,断开时它会记下来,这里去取。0x13 是对方主动
+            // 终止(关机或闲置休眠),别去硬拉。
+            int reason = Privileged.lastDisconnectReason(d.getAddress());
+            synchronized (tuned) {
+                tuned.remove(d.getAddress());
+            }
             log("链路断开 " + d.getAddress() + " 原因 " + reason);
             if (reason == REMOTE_TERMINATED) {
                 nativeOnPeerLeft(d.getAddress());
@@ -433,6 +432,33 @@ public final class Rearm {
             }
         });
     }
+
+    /**
+     * 布防设备连上之后,把监督超时拉长。
+     *
+     * <p>掉线的形态是平板突然收不到手柄的包,而手柄那边一直听得见平板(见 README
+     * 「空口抓包」一节)。只要平板的接收在几秒内恢复,把判死线放到 20 秒就能让链路
+     * 扛过那段静默,游戏里表现为卡一下而不是断开重连。安卓公开接口最多给 5 秒,
+     * 更长的要走 shell 进程里的隐藏接口。这是实验:静默到底多长没人知道,现有
+     * 数据只知道超过 5 秒。
+     */
+    public static void tuneLink(String mac) {
+        synchronized (tuned) {
+            if (tuned.contains(mac)) return;
+        }
+        String line = Privileged.tuneLink(mac);
+        // 服务还没绑上就先不记,下一轮巡检再来;这正是启动那几秒的情形。
+        if (line == null) return;
+        log(line);
+        if (line.startsWith("已挂") || line.startsWith("链路参数客户端已挂着")) {
+            synchronized (tuned) {
+                tuned.add(mac);
+            }
+        }
+    }
+
+    /** 本次链路上已经挂好参数客户端的设备。断开即清,巡检据此不重复去挂。 */
+    private static final Set<String> tuned = new HashSet<>();
 
     /** 特权连接状态,给界面常驻显示。Rust 只认这个类,故在此转一道。 */
     public static String privilegedStatus() {

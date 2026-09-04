@@ -17,6 +17,20 @@ interface IPrivilegedConnect {
      */
     String connect(String mac) = 1;
 
+    /**
+     * 往这台设备已经建好的链路上挂一个观察用的 GATT 客户端,连上就把监督超时拉长,
+     * 断开时记下原因码。
+     *
+     * @return 一行结果,原样进界面日志
+     */
+    String tuneLink(String mac) = 2;
+
+    /**
+     * 上一次断开的 HCI 原因码(取走即清),没记录时返回 -1。
+     * 系统接管的链路在应用这边没有回调,原因码只有挂在链路上的那个客户端看得到。
+     */
+    int lastDisconnectReason(String mac) = 3;
+
     /** 结束服务进程。Shizuku 解绑时调用。 */
     void destroy() = 16777114;
 }
