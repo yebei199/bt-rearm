@@ -11,6 +11,8 @@ import android.os.Bundle;
 import java.util.ArrayList;
 import java.util.List;
 
+import io.github.yebei199.btrearm.diagnostics.Diagnostics;
+
 /**
  * 极薄的 NativeActivity 子类。界面与布防决策都在 Rust 里,这里只负责三件事:
  * 把 Context 交给 {@link Rearm}、要蓝牙权限、权限到手后通知 Rust 重开扫描
@@ -69,11 +71,26 @@ public class MainActivity extends NativeActivity {
     }
 
     private void ready() {
+        Diagnostics.record("permissions_ready", "bluetooth granted");
         // 特权连接要等 Shizuku 的绑定器到位,越早挂上监听越好。
         Privileged.init(this);
         // 权限到手之前发起的开扫必然失败,这里让 Rust 按当前名单重来一次。
         Rearm.resumeScan();
         // 布防活在进程里,进程要活过切后台 —— 前台服务是那张「别冻我」的凭据。
         startForegroundService(new Intent(this, RearmService.class));
+    }
+
+    /** 明确前后台切换，后台心跳不能依赖界面定时器。 */
+    @Override
+    protected void onResume() {
+        super.onResume();
+        Diagnostics.record("activity_resume", "foreground");
+    }
+
+    /** 游戏接管前台时仍由独立采样线程落盘。 */
+    @Override
+    protected void onPause() {
+        Diagnostics.record("activity_pause", "background");
+        super.onPause();
     }
 }

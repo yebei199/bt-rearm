@@ -1,5 +1,7 @@
 package io.github.yebei199.btrearm;
 
+import io.github.yebei199.btrearm.diagnostics.Diagnostics;
+
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -101,6 +103,7 @@ public final class Rearm {
 
     public static synchronized void attach(Context c) {
         ctx = c.getApplicationContext();
+        Diagnostics.start(ctx);
         // 连接状态改由系统的 ACL 广播提供 —— connect() 把连接交给系统栈之后,
         // 我们不再持有 GATT 客户端,也就没有自己的回调可听。
         IntentFilter f = new IntentFilter();
@@ -116,6 +119,7 @@ public final class Rearm {
         @Override
         public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
             String mac = g.getDevice().getAddress();
+            Diagnostics.record("gatt_state", "mac=" + mac + " status=" + status + " state=" + newState);
             if (newState != BluetoothProfile.STATE_CONNECTED) {
                 synchronized (Rearm.class) {
                     closeQuietly(gatts.remove(mac));
@@ -262,6 +266,7 @@ public final class Rearm {
      * 配对记录里的正确类型。
      */
     public static void connect(String mac) {
+        Diagnostics.record("connect_request", "mac=" + mac);
         BluetoothDevice d = bonded(mac);
         if (d == null) {
             log(mac + " 不在已配对列表里");
@@ -401,6 +406,7 @@ public final class Rearm {
     /** @param macList 换行分隔的 MAC 列表,理由同 startScan。 */
     public static synchronized void saveArmed(String macList) {
         if (ctx == null) return;
+        Diagnostics.record("armed_changed", macList);
         Set<String> set = new HashSet<>();
         if (!macList.isEmpty()) {
             Collections.addAll(set, macList.split("\n"));
@@ -427,7 +433,9 @@ public final class Rearm {
         TICKER.post(new Runnable() {
             @Override
             public void run() {
+                Diagnostics.record("tick_begin", "scheduled");
                 nativeTick();
+                Diagnostics.record("tick_end", "completed");
                 TICKER.postDelayed(this, TICK_MS);
             }
         });
@@ -546,6 +554,7 @@ public final class Rearm {
      * 而想看应用内那份日志就得把界面切到前台 —— 用户正在打游戏时这么做是不礼貌的。
      */
     private static void log(String line) {
+        Diagnostics.record("app_event", line);
         android.util.Log.i("btrearm", line);
         nativeOnError(line);
     }

@@ -7,6 +7,7 @@ import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.os.IBinder;
+import io.github.yebei199.btrearm.diagnostics.Diagnostics;
 
 /**
  * 保活用前台服务。布防的 GATT 客户端都是进程内对象,进程被冻结或回收,
@@ -26,6 +27,7 @@ public class RearmService extends Service {
                 .setContentTitle("蓝牙布防运行中")
                 .build();
         startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
+        Diagnostics.record("service_foreground", "start_id=" + startId);
         // 不用 START_STICKY:布防的引擎与 Context 都随界面创建而初始化,进程被系统
         // 回收后,单独被拉回来的服务里什么都没有 —— 它会挂着「运行中」的通知却不
         // 扫描、不重试。那比不工作更糟,因为它在骗人。宁可安静地不在。
@@ -35,5 +37,12 @@ public class RearmService extends Service {
     @Override
     public IBinder onBind(Intent intent) {
         return null;
+    }
+
+    /** 正常停止有事件，系统直接杀进程时用心跳缺口识别。 */
+    @Override
+    public void onDestroy() {
+        Diagnostics.record("service_destroy", "stopped");
+        super.onDestroy();
     }
 }
