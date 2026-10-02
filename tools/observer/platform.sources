@@ -206,13 +206,37 @@ package android.bluetooth;
 import android.content.AttributionSource;
 import android.os.Handler;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.List;
 /** GATT 系统边界，记录真实业务发出的对象、附着参数和关闭次数。 */
 public final class BluetoothGatt {
     /** 平台成功码。 */
     public static final int GATT_SUCCESS = 0;
     /** 构造出的所有对象，不能被 fixture 自动回收。 */
-    public static final List<BluetoothGatt> created = new ArrayList<>();
+    public static final List<BluetoothGatt> created = Collections.synchronizedList(new ArrayList<>());
+    /** 每用例独占的平台注册/关闭阻塞，握手仅报告平台入口，不改业务状态。 */
+    public static final class Gate {
+        /** 证明平台调用已经进入。 */
+        public final CountDownLatch entered = new CountDownLatch(1);
+        /** 用例finally释放，只阻塞当前调用。 */
+        public final CountDownLatch release = new CountDownLatch(1);
+        /** 上限只防止用例死锁，不自动推进业务。 */
+        public void awaitRelease() {
+            entered.countDown();
+            try {
+                if (!release.await(15, TimeUnit.SECONDS)) throw new AssertionError("platform gate not released");
+            } catch (InterruptedException failure) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("platform gate interrupted", failure);
+            }
+        }
+    }
+    /** 下一次注册独占门闩，connect入口取走后不影响下一对象。 */
+    public static Gate nextRegistrationGate;
+    /** 只阻塞该对象的close。 */
+    public Gate closeGate;
     /** 下一次注册的返回值或异常输入。 */
     public static boolean accept = true, throwOnRegister;
     /** 创建时的系统服务身份。 */
@@ -224,7 +248,7 @@ public final class BluetoothGatt {
     /** opportunistic 必须为真。 */
     public final boolean opportunistic;
     /** 实际注册次数与实际关闭次数。 */
-    public int registrations, closes;
+    public volatile int registrations, closes;
     /** 实际注册的 autoConnect 值。 */
     public Boolean autoConnect;
     /** 生产传入的回调。 */
@@ -243,6 +267,9 @@ public final class BluetoothGatt {
     public boolean connect(Boolean autoConnect, BluetoothGattCallback callback, Handler handler) {
         this.autoConnect = autoConnect; this.callback = callback; this.handler = handler;
         registrations++;
+        Gate gate = nextRegistrationGate;
+        nextRegistrationGate = null;
+        if (gate != null) gate.awaitRelease();
         if (throwOnRegister) throw new IllegalStateException("registration failed");
         return accept;
     }
@@ -253,13 +280,20 @@ public final class BluetoothGatt {
     /** 所有 PHY 写入路径立即失败。 */
     public void setPreferredPhy(int tx, int rx, int options) { throw io.github.yebei199.btrearm.PlatformViolations.forbidden("observer changed PHY"); }
     /** 仅记录实际关闭动作，不能删除业务条目。 */
-    public void close() { closes++; }
+    public void close() {
+        closes++;
+        if (closeGate != null) closeGate.awaitRelease();
+    }
     /** 交出真实配对记录对象。 */
     public BluetoothDevice getDevice() { return device; }
-    /** 旧对象关闭后仍能产生迟到回调，按注册的 worker 排队。 */
-    public void emit(int reason, int state) throws Exception {
+    /** 投递真实注册回调，不等待worker，便于握手观察被阻塞的平台close。 */
+    public void emitQueued(int reason, int state) {
         if (callback == null || handler == null) throw new AssertionError("no registered callback");
         handler.post(() -> callback.onConnectionStateChange(this, reason, state));
+    }
+    /** 旧对象关闭后仍能产生迟到回调，按注册的 worker 排队。 */
+    public void emit(int reason, int state) throws Exception {
+        emitQueued(reason, state);
         handler.drain();
     }
 }

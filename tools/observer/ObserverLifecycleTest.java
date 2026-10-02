@@ -19,6 +19,9 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.TimeUnit;
 
 /** 每条用例从真实业务入口到 GATT 对象或 JNI 事件；平台状态只从边界注入。 */
@@ -418,6 +421,161 @@ public final class ObserverLifecycleTest {
         require(service.lastDisconnectReason(MAC) == 19, "reading other MAC consumed current reason");
         service.watchLink(OTHER_MAC);
         require(BluetoothGatt.created.size() == 2, "other observer was removed");
+    }
+
+    /** 已记19的回调卡在平台close时，真实ACL仍须立即消费并发出peer-left。 */
+    public static void testRecordedPeerLeftSurvivesBlockedClose() throws Exception {
+        setup();
+        BluetoothGatt old = watch();
+        var gate = new BluetoothGatt.Gate();
+        old.closeGate = gate;
+        var calls = Executors.newSingleThreadExecutor();
+        try {
+            old.emitQueued(19, BluetoothProfile.STATE_DISCONNECTED);
+            require(gate.entered.await(5, TimeUnit.SECONDS), "callback did not enter blocked close");
+            awaitCall(calls.submit(() -> acl(false)), "ACL waited for callback close instead of consuming recorded 19");
+            require(nativeEvents.stream().filter(value -> value.equals("peer-left:" + MAC)).count() == 1,
+                    "recorded 19 did not produce exactly one peer-left");
+            require(!nativeEvents.contains("disconnected:" + MAC), "recorded 19 degraded to unknown policy");
+            int consumed = awaitCall(calls.submit(() -> service.lastDisconnectReason(MAC)),
+                    "reason read waited for callback close");
+            require(consumed == -1, "ACL did not consume recorded reason once");
+        } finally {
+            releaseCalls(gate, calls);
+            old.handler.drain();
+        }
+        require(old.closes == 1 && service.lastDisconnectReason(MAC) == -1,
+                "released callback left an old reason or repeated close");
+    }
+
+    /** ACL自身退休健康观察器时，平台close阻塞不能阻挡出口或让迟到回调发布原因。 */
+    public static void testAclRetiresHealthyObserverBeforeBlockedClose() throws Exception {
+        setup();
+        BluetoothGatt old = watch();
+        old.emit(0, BluetoothProfile.STATE_CONNECTED);
+        var gate = new BluetoothGatt.Gate();
+        old.closeGate = gate;
+        var calls = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> aclCall = calls.submit(() -> acl(false));
+            require(gate.entered.await(5, TimeUnit.SECONDS), "ACL retirement did not enter platform close");
+            awaitCall(aclCall, "ACL waited for its own observer close");
+            require(nativeEvents.contains("disconnected:" + MAC) && !nativeEvents.contains("peer-left:" + MAC),
+                    "ACL without a reason changed unknown policy");
+            old.emitQueued(19, BluetoothProfile.STATE_DISCONNECTED);
+        } finally {
+            releaseCalls(gate, calls);
+            old.handler.drain();
+        }
+        require(old.closes == 1 && service.lastDisconnectReason(MAC) == -1,
+                "retired healthy observer republished a late reason");
+        BluetoothGatt current = watch();
+        old.emit(19, BluetoothProfile.STATE_DISCONNECTED);
+        service.watchLink(MAC);
+        require(BluetoothGatt.created.size() == 2 && current != old && current.closes == 0,
+                "late callback removed the replacement observer");
+        current.emit(8, BluetoothProfile.STATE_DISCONNECTED);
+        require(service.lastDisconnectReason(MAC) == 8, "replacement observer lost current reason ownership");
+    }
+
+    /** 另一MAC注册阻塞时，本设备已记录的19仍能从真实ACL及时消费。 */
+    public static void testRecordedPeerLeftSurvivesOtherRegistration() throws Exception {
+        setup();
+        BluetoothGatt old = watch();
+        old.emit(19, BluetoothProfile.STATE_DISCONNECTED);
+        BluetoothAdapter.bonded.add(new BluetoothDevice(OTHER_MAC));
+        var gate = new BluetoothGatt.Gate();
+        BluetoothGatt.nextRegistrationGate = gate;
+        var calls = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> registration = calls.submit(() -> Rearm.watchLink(OTHER_MAC));
+            require(gate.entered.await(5, TimeUnit.SECONDS), "other MAC did not enter blocked registration");
+            awaitCall(calls.submit(() -> acl(false)), "recorded reason waited for another MAC registration");
+            require(nativeEvents.contains("peer-left:" + MAC) && !nativeEvents.contains("disconnected:" + MAC),
+                    "blocked registration degraded recorded 19");
+            require(awaitCall(calls.submit(() -> service.lastDisconnectReason(MAC)),
+                    "reason getter waited for another MAC registration") == -1, "reason consumed twice");
+            gate.release.countDown();
+            awaitCall(registration, "released registration did not finish");
+        } finally {
+            releaseCalls(gate, calls);
+        }
+        BluetoothGatt other = BluetoothGatt.created.get(1);
+        other.handler.drain();
+        service.watchLink(OTHER_MAC);
+        require(BluetoothGatt.created.size() == 2 && other.closes == 0,
+                "ACL retirement crossed MAC ownership into the blocked registration");
+        require(service.lastDisconnectReason(MAC) == -1, "released registration restored consumed reason");
+    }
+
+    /** ACL断开在注册返回前退休旧连接，旧成功不能重新获得观察所有权。 */
+    public static void testAclDisconnectionRetiresInFlightRegistration() throws Exception {
+        requireInFlightRegistrationRetired(() -> acl(false), "disconnected:");
+    }
+
+    /** ACL新连接同样隔离上一连接在途注册，既有连接出口保持。 */
+    public static void testAclConnectionRetiresInFlightRegistration() throws Exception {
+        requireInFlightRegistrationRetired(() -> acl(true), "connected:");
+    }
+
+    /** 适配器失效并恢复时，在途旧注册也不能重新取得已经退休的服务世代。 */
+    public static void testAdapterInvalidationRetiresInFlightRegistration() throws Exception {
+        requireInFlightRegistrationRetired(() -> {
+            state(BluetoothAdapter.STATE_TURNING_OFF);
+            state(BluetoothAdapter.STATE_ON);
+        }, null);
+    }
+
+    /** 平台注册门闩跨过真实退休信号后才释放，检验旧返回、迟到回调与新对象去重。 */
+    private static void requireInFlightRegistrationRetired(Runnable retire, String expectedEvent) throws Exception {
+        setup();
+        var gate = new BluetoothGatt.Gate();
+        BluetoothGatt.nextRegistrationGate = gate;
+        var calls = Executors.newFixedThreadPool(2);
+        BluetoothGatt old = null;
+        try {
+            Future<?> registration = calls.submit(() -> Rearm.watchLink(MAC));
+            require(gate.entered.await(5, TimeUnit.SECONDS), "observer did not enter blocked registration");
+            old = BluetoothGatt.created.get(0);
+            awaitCall(calls.submit(retire), "retirement waited for in-flight registration");
+            boolean unchangedPolicy = expectedEvent == null
+                    ? !nativeEvents.contains("connected:" + MAC) && !nativeEvents.contains("disconnected:" + MAC)
+                    : nativeEvents.contains(expectedEvent + MAC);
+            require(unchangedPolicy && !nativeEvents.contains("peer-left:" + MAC),
+                    "retirement changed its existing policy");
+            gate.release.countDown();
+            awaitCall(registration, "released registration did not finish");
+        } finally {
+            releaseCalls(gate, calls);
+            if (old != null) old.handler.drain();
+        }
+        require(old != null && old.closes == 1, "in-flight old success regained ownership or leaked its object");
+        old.emit(19, BluetoothProfile.STATE_DISCONNECTED);
+        require(service.lastDisconnectReason(MAC) == -1, "retired registration published a late reason");
+        BluetoothGatt current = watch();
+        old.emit(19, BluetoothProfile.STATE_DISCONNECTED);
+        Rearm.watchLink(MAC);
+        require(BluetoothGatt.created.size() == 2 && current != old && current.closes == 0,
+                "in-flight old return or callback removed the replacement");
+        requirePassive(current);
+        current.emit(8, BluetoothProfile.STATE_DISCONNECTED);
+        require(service.lastDisconnectReason(MAC) == 8, "current registration lost reason ownership");
+    }
+
+    /** 有界等待只作失败保护，超时明确归因于阻塞的业务入口。 */
+    private static <T> T awaitCall(Future<T> call, String message) throws Exception {
+        try {
+            return call.get(3, TimeUnit.SECONDS);
+        } catch (TimeoutException failure) {
+            throw new AssertionError(message, failure);
+        }
+    }
+
+    /** 每用例finally先解除平台阻塞再等自己的调用退出，保证没有遗留任务。 */
+    private static void releaseCalls(BluetoothGatt.Gate gate, ExecutorService calls) throws Exception {
+        gate.release.countDown();
+        calls.shutdown();
+        require(calls.awaitTermination(5, TimeUnit.SECONDS), "test calls did not finish after releasing platform gate");
     }
 
     /** 只延迟传输返回；内部仍调用真实 PrivilegedConnect，不制造观察成功。 */

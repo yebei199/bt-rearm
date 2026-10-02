@@ -30,7 +30,7 @@ mutation = "保留gatts或tuned任一旧缓存、允许失效后在途旧成功�
 id = "AC-5"
 kind = "new"
 entry = "真实注册LinkWatcher收到旧/新对象的CONNECTED和DISCONNECTED；真实ACL receiver与PrivilegedConnect.lastDisconnectReason两种事件顺序"
-observe = "旧对象不会close或删除新观察器，不发布新世代原因；当前原因一次消费；新连接不读上一连接原因；ACL先到输出unknown且不留下迟到原因"
+observe = "旧对象不会close或删除新观察器，不发布新世代原因；当前原因一次消费；新连接不读上一连接原因；ACL先到输出unknown且不留下迟到原因；已记录19在平台close或另一MAC注册阻塞期间仍被ACL及时消费并发出peer-left；ACL自身退休不等close；在途旧注册跨过ACL/适配器退休后不能重新获得条目或原因所有权"
 tests = [
   "io.github.yebei199.btrearm.ObserverLifecycleTest::testOldDisconnectCannotRemoveNewObserver",
   "io.github.yebei199.btrearm.ObserverLifecycleTest::testOldConnectedCannotReviveOldObserver",
@@ -40,9 +40,15 @@ tests = [
   "io.github.yebei199.btrearm.ObserverLifecycleTest::testAclBeforeCallbackKeepsUnknownAndDropsLateReason",
   "io.github.yebei199.btrearm.ObserverLifecycleTest::testLateReasonAfterReattachIsIgnored",
   "io.github.yebei199.btrearm.ObserverLifecycleTest::testServiceRestartDiscardsOldReason",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testRecordedPeerLeftSurvivesBlockedClose",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testAclRetiresHealthyObserverBeforeBlockedClose",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testRecordedPeerLeftSurvivesOtherRegistration",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testAclDisconnectionRetiresInFlightRegistration",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testAclConnectionRetiresInFlightRegistration",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testAdapterInvalidationRetiresInFlightRegistration",
 ]
-doubles = ["Android GATT/Handler边界只投递真实注册回调，不重写gatts/lastReason；JNI只记录真实ACL出口；不能证明系统真实事件到达先后"]
-mutation = "恢复按MAC无条件remove/写lastReason，使旧回调伤害新对象或原因断言失败；不清新连接原因槽，使旧19被下一连接消费"
+doubles = ["Android GATT/Handler边界只投递真实注册回调，不重写gatts/lastReason；close/connect门闩只握手并阻塞平台调用，由每用例finally释放；JNI只记录真实ACL出口；不能证明系统真实事件到达先后或真机ANR"]
+mutation = "恢复按MAC无条件remove/写lastReason，使旧回调伤害新对象或原因断言失败；不清新连接原因槽，使旧19被下一连接消费；把原因消费排进阻塞worker或锁内关闭GATT，使阻塞平台调用期间真实ACL完成断言失败；移除注册提交时的退休世代校验，使旧成功/迟到原因或新对象身份断言失败"
 
 [[ac]]
 id = "AC-5"
