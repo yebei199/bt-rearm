@@ -22,7 +22,7 @@ import rikka.shizuku.Shizuku;
 final class Privileged {
 
     /** 用户服务版本号,改了服务实现要加一,否则 Shizuku 会复用旧进程。 */
-    private static final int SERVICE_VERSION = 3;
+    private static final int SERVICE_VERSION = 4;
 
     private static final int PERMISSION_REQUEST_CODE = 2;
 
@@ -147,12 +147,23 @@ final class Privileged {
         }
     }
 
-    /** 上一次断开的 HCI 原因码;服务不在或没记录时为 -1。 */
-    static int lastDisconnectReason(String mac) {
+    /** 适配器离开可用状态时退休用户服务中的观察句柄。 */
+    static void invalidateObservers() {
+        IPrivilegedConnect s = service;
+        if (s == null) return;
+        try {
+            s.invalidateObservers();
+        } catch (Exception e) {
+            Rearm.note("退休链路观察客户端失败: " + e);
+        }
+    }
+
+    /** ACL结束旧连接并消费原因；服务不在或没记录时为 -1。 */
+    static int retireConnection(String mac) {
         IPrivilegedConnect s = service;
         if (s == null) return -1;
         try {
-            return s.lastDisconnectReason(mac);
+            return s.retireConnection(mac);
         } catch (Exception e) {
             return -1;
         }

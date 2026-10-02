@@ -4,7 +4,7 @@
 
 运行入口是 `bash tools/observer/test.sh`，需要 JDK 17、C 编译器及 Linux JNI headers。`--compile-only` 只编译测试和真实 Java 类，不执行行为；`--list` 列出测试名；默认按环境预算有界并行，每个用例在独立 JVM 中执行，汇总 JUnit 到 `.dispatch/1-observer-junit.xml`。临时源码、类和 JNI 库都在本次运行独占的目录，退出后回收。这个小型编译不构建 APK 或 Rust 库。行为执行前，运行环境须给出 `OBSERVER_TEST_WORKERS` 正整数预算（或已有的 `NIX_BUILD_CORES`）；缺失预算会明确失败，无固定全机并行数，也不隐式退回串行。
 
-当前提交是待主路由审查的测试骨架。未运行行为 RED，未写生产修复。主路由 proceed 后才能执行默认入口，确认失败来自行为断言，再实施修复。
+测试设计已获主路由 proceed；修复前26条行为用例中18条因业务断言失败，8条既有特征通过。修复后同一组断言全部通过。原始 RED/GREEN 与干净快照检查证据由本任务 `.dispatch/1-*` 报告保存；离线结果不替代真实 Android 接口编译或最终验收。
 
 `platform.sources` 按文件标记展开平台替身。Handler 的即时任务运行在单独的串行 daemon worker，延时任务只记录、不自动触发；GATT 回调投递到生产代码传入的 Handler，测试使用队列屏障控制先后，不使用 sleep。Context 依据生产注册的 filter 分发广播。GATT 替身记录真实构造、注册和关闭对象，主动连接及参数修改会立即失败。Binder 替身保留当前接口身份与死亡回调，Shizuku 替身驱动真实 ServiceConnection。JNI 库记录真实 Java 发出的连接和 peer-left 事件；不执行 Rust 决策。
 

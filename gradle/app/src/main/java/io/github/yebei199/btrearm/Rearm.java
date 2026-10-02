@@ -112,6 +112,7 @@ public final class Rearm {
         // 服务 UUID 发现完成的广播 —— 系统的 PhonePolicy 也在听它,收到即说明
         // 触发已送达,连接该由系统自己发起了。
         f.addAction(BluetoothDevice.ACTION_UUID);
+        f.addAction(BluetoothAdapter.ACTION_STATE_CHANGED);
         ctx.registerReceiver(ACL, f);
     }
 
@@ -164,6 +165,12 @@ public final class Rearm {
     private static final BroadcastReceiver ACL = new BroadcastReceiver() {
         @Override
         public void onReceive(Context c, Intent intent) {
+            if (BluetoothAdapter.ACTION_STATE_CHANGED.equals(intent.getAction())) {
+                // 状态广播可能没有ACL事件；离开ON就退休所有观察句柄。
+                if (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.STATE_OFF)
+                        != BluetoothAdapter.STATE_ON) Privileged.invalidateObservers();
+                return;
+            }
             BluetoothDevice d = intent.getParcelableExtra(
                     BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.class);
             if (d == null) return;
@@ -172,6 +179,8 @@ public final class Rearm {
                 return;
             }
             if (BluetoothDevice.ACTION_ACL_CONNECTED.equals(intent.getAction())) {
+                // 新连接先丢弃上次残余原因，再让Rust按既有策略巡检附着。
+                Privileged.retireConnection(d.getAddress());
                 nativeOnConnectionChange(d.getAddress(), true);
                 return;
             }
@@ -179,10 +188,7 @@ public final class Rearm {
             // EXTRA_TRANSPORT)。原因码只有挂在链路上的 GATT 客户端看得到,那个
             // 客户端在 shell 进程里,断开时它会记下来,这里去取。0x13 是对方主动
             // 终止(关机或闲置休眠),别去硬拉。
-            int reason = Privileged.lastDisconnectReason(d.getAddress());
-            synchronized (tuned) {
-                tuned.remove(d.getAddress());
-            }
+            int reason = Privileged.retireConnection(d.getAddress());
             log("链路断开 " + d.getAddress() + " 原因 " + reason);
             if (reason == REMOTE_TERMINATED) {
                 nativeOnPeerLeft(d.getAddress());
@@ -449,22 +455,10 @@ public final class Rearm {
      * 「链路失效」要反着处理,分不出来就会对着一台想休息的手柄硬拉。
      */
     public static void watchLink(String mac) {
-        synchronized (tuned) {
-            if (tuned.contains(mac)) return;
-        }
+        // 观察身份只有用户服务持有；每次巡检验证服务，不缓存跨进程成功返回。
         String line = Privileged.watchLink(mac);
-        // 服务还没绑上就先不记,下一轮巡检再来;这正是启动那几秒的情形。
-        if (line == null) return;
-        log(line);
-        if (line.startsWith("已挂") || line.startsWith("链路观察客户端已挂着")) {
-            synchronized (tuned) {
-                tuned.add(mac);
-            }
-        }
+        if (line != null && !line.startsWith("链路观察客户端已挂着")) log(line);
     }
-
-    /** 本次链路上已经挂好参数客户端的设备。断开即清,巡检据此不重复去挂。 */
-    private static final Set<String> tuned = new HashSet<>();
 
     /** 特权连接状态,给界面常驻显示。Rust 只认这个类,故在此转一道。 */
     public static String privilegedStatus() {

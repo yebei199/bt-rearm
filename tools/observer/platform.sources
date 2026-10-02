@@ -130,7 +130,7 @@ import android.os.IBinder;
 import java.util.ArrayList;
 import java.util.List;
 /** 每次系统 GATT 服务重建拥有新 binder，旧 binder 可明确失效。 */
-public final class IBluetoothGatt implements IBinder {
+public final class IBluetoothGatt implements IBinder, android.os.IInterface {
     /** 当前 binder 是否存活。 */
     private boolean alive = true;
     /** 生产代码注册的死亡监听。 */
@@ -421,6 +421,10 @@ public interface IPrivilegedConnect {
     String watchLink(String mac) throws Exception;
     /** 真实服务公开入口。 */
     int lastDisconnectReason(String mac) throws Exception;
+    /** 真实服务观察器失效入口。 */
+    void invalidateObservers() throws Exception;
+    /** 真实服务ACL退休入口。 */
+    int retireConnection(String mac) throws Exception;
     /** 真实服务公开入口。 */
     void destroy() throws Exception;
     /** 与 Android 生成的 Stub 保持形状。 */
@@ -696,4 +700,12 @@ public final class PlatformViolations {
     public static final List<String> attempts = new ArrayList<>();
     /** 同时记录和拒绝动作，结果仍由真实业务调用决定。 */
     public static AssertionError forbidden(String action) { attempts.add(action); return new AssertionError(action); }
+}
+
+@@ IInterface.java
+package android.os;
+/** 真实Android的AIDL接口通过asBinder交出底层传输身份。 */
+public interface IInterface {
+    /** 不能直接把远端接口强转成IBinder。 */
+    IBinder asBinder();
 }

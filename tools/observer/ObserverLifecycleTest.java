@@ -445,6 +445,10 @@ public final class ObserverLifecycleTest {
         }
         /** 消费仍走真实服务。 */
         public int lastDisconnectReason(String mac) { return delegate.lastDisconnectReason(mac); }
+        /** 只转发平台失效信号到真实服务，不在替身中清业务状态。 */
+        public void invalidateObservers() { delegate.invalidateObservers(); }
+        /** 只转发ACL退休到真实服务。 */
+        public int retireConnection(String mac) { return delegate.retireConnection(mac); }
         /** 子JVM退出统一回收，不调用生产System.exit。 */
         public void destroy() {}
     }

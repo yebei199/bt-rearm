@@ -30,6 +30,12 @@ interface IPrivilegedConnect {
      */
     int lastDisconnectReason(String mac) = 3;
 
+    /** 适配器失效时退休观察句柄和旧原因，不发起连接。 */
+    void invalidateObservers() = 4;
+
+    /** ACL退休当前连接并消费原因，晚到回调不再持有原因槽。 */
+    int retireConnection(String mac) = 5;
+
     /** 结束服务进程。Shizuku 解绑时调用。 */
     void destroy() = 16777114;
 }

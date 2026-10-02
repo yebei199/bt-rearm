@@ -75,4 +75,4 @@ mutation = "关闭opportunistic或启用autoConnect/主动connectGatt/参数写�
 
 [[ac]]
 id = "AC-6"
-none = "测试设计审核/proceed、RED/GREEN证据、必要APK构建、targeted干净快照凭据及无设备操作是交付流程，必须由主路由核对原始证据；本测试骨架尚不宣称已满足"
+none = "测试设计审核/proceed、RED/GREEN证据、必要APK构建、targeted干净快照凭据及无设备操作是交付流程，必须由主路由核对原始证据；离线行为通过不代替这些流程核对"
