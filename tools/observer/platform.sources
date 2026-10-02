@@ -1,0 +1,699 @@
+@@ IBinder.java
+package android.os;
+/** Binder 传输边界，只模拟可用身份和死亡通知。 */
+public interface IBinder {
+    /** 平台的死亡回调形状。 */
+    interface DeathRecipient { void binderDied(); }
+    /** 默认活着，具体测试 binder 覆盖。 */
+    default boolean isBinderAlive() { return true; }
+    /** 默认活着，具体测试 binder 覆盖。 */
+    default boolean pingBinder() { return isBinderAlive(); }
+    /** 记录调用方注册的死亡监听。 */
+    default void linkToDeath(DeathRecipient recipient, int flags) {}
+    /** 删除调用方注册的死亡监听。 */
+    default boolean unlinkToDeath(DeathRecipient recipient, int flags) { return true; }
+}
+@@ RemoteException.java
+package android.os;
+/** 保留平台异常类型，拒绝路径由 fixture 注入。 */
+public class RemoteException extends Exception {
+    /** 空异常供测试边界使用。 */
+    public RemoteException() {}
+}
+@@ Looper.java
+package android.os;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+/** 一个 worker 一条串行队列，daemon 不阻塞独立 JVM 退出。 */
+public final class Looper {
+    /** 模拟该 Looper 的调度队列。 */
+    final ExecutorService queue = Executors.newSingleThreadExecutor(task -> {
+        Thread thread = new Thread(task, "observer-fixture-worker");
+        thread.setDaemon(true);
+        return thread;
+    });
+}
+@@ HandlerThread.java
+package android.os;
+/** 提供 Handler 使用的独立队列，不伪造业务线程结果。 */
+public final class HandlerThread {
+    /** 当前 worker 的循环。 */
+    private final Looper looper = new Looper();
+    /** 名称只是平台参数。 */
+    public HandlerThread(String name) {}
+    /** Looper 构造时已准备好队列。 */
+    public void start() {}
+    /** 交出该线程的队列。 */
+    public Looper getLooper() { return looper; }
+}
+@@ Handler.java
+package android.os;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+/** 即时任务串行运行，延时任务不自动触发，测试不依赖墙钟。 */
+public final class Handler {
+    /** 当前调度队列。 */
+    private final Looper looper;
+    /** 已执行任务的异常必须暴露，Executor不能静默吞掉。 */
+    private final java.util.List<Throwable> failures = new java.util.concurrent.CopyOnWriteArrayList<>();
+    /** 默认 handler 也拥有独立 worker。 */
+    public Handler() { this(new Looper()); }
+    /** 绑定生产构造提供的循环。 */
+    public Handler(Looper looper) { this.looper = looper; }
+    /** 排入真实 Runnable，业务逻辑原样执行。 */
+    public boolean post(Runnable task) {
+        looper.queue.submit(() -> { try { task.run(); } catch (Throwable failure) { failures.add(failure); } });
+        return true;
+    }
+    /** 定时器超出测试边界，不推进 fake 时间。 */
+    public boolean postDelayed(Runnable task, long delay) { return true; }
+    /** 等此前排入的回调执行完，超时只作为死锁失败上限。 */
+    public void drain() throws Exception {
+        CountDownLatch done = new CountDownLatch(1);
+        post(done::countDown);
+        if (!done.await(5, TimeUnit.SECONDS)) throw new AssertionError("worker did not drain");
+        if (!failures.isEmpty()) throw new AssertionError("worker callback failed", failures.get(0));
+    }
+}
+@@ Process.java
+package android.os;
+/** 归属校验只需要 shell UID，不涉及设备进程。 */
+public final class Process {
+    /** 返回 shell 的平台 UID。 */
+    public static int myUid() { return 2000; }
+}
+@@ BluetoothServiceManager.java
+package android.os;
+/** 反射初始化需要真实名称的空平台壳。 */
+public final class BluetoothServiceManager {
+    /** 仅允许生产反射构造。 */
+    public BluetoothServiceManager() {}
+}
+@@ ServiceManager.java
+package android.os;
+import android.bluetooth.IBluetoothManager;
+/** 反射读取的系统 manager binder。 */
+public final class ServiceManager {
+    /** 只交出 manager 的传输壳。 */
+    public static IBinder getService(String name) { return IBluetoothManager.MANAGER; }
+}
+@@ AttributionSource.java
+package android.content;
+/** 记录生产反射构造使用的 shell attribution。 */
+public final class AttributionSource {
+    /** Android API 的 builder 形状。 */
+    public static final class Builder {
+        /** 保留 UID 输入边界。 */
+        public Builder(int uid) {}
+        /** 保留包名输入边界。 */
+        public Builder setPackageName(String name) { return this; }
+        /** 交出不可变归属壳。 */
+        public AttributionSource build() { return new AttributionSource(); }
+    }
+}
+@@ IBluetoothManager.java
+package android.bluetooth;
+import android.os.IBinder;
+/** 只隔开系统蓝牙 manager，不参与业务缓存。 */
+public interface IBluetoothManager {
+    /** 平台 manager 的稳定 binder。 */
+    IBinder MANAGER = new IBinder() {};
+    /** 保持生产代码反射使用的 Stub 入口。 */
+    final class Stub {
+        /** 返回 manager 接口。 */
+        public static IBluetoothManager asInterface(IBinder binder) { return new IBluetoothManager() {}; }
+    }
+}
+@@ IBluetoothGatt.java
+package android.bluetooth;
+import android.os.IBinder;
+import java.util.ArrayList;
+import java.util.List;
+/** 每次系统 GATT 服务重建拥有新 binder，旧 binder 可明确失效。 */
+public final class IBluetoothGatt implements IBinder {
+    /** 当前 binder 是否存活。 */
+    private boolean alive = true;
+    /** 生产代码注册的死亡监听。 */
+    private final List<DeathRecipient> deaths = new ArrayList<>();
+    /** Android AIDL 接口的 binder 入口。 */
+    public IBinder asBinder() { return this; }
+    /** 只返回平台状态，不清理业务缓存。 */
+    @Override public boolean isBinderAlive() { return alive; }
+    /** 记录生产监听。 */
+    @Override public void linkToDeath(DeathRecipient recipient, int flags) { deaths.add(recipient); }
+    /** 删除生产监听。 */
+    @Override public boolean unlinkToDeath(DeathRecipient recipient, int flags) { return deaths.remove(recipient); }
+    /** 注入死亡信号，是否处理完全由生产代码决定。 */
+    public void die() { alive = false; for (DeathRecipient callback : List.copyOf(deaths)) callback.binderDied(); }
+}
+@@ BluetoothFrameworkInitializer.java
+package android.bluetooth;
+import android.os.BluetoothServiceManager;
+/** 满足生产代码 app_process 反射初始化边界。 */
+public final class BluetoothFrameworkInitializer {
+    /** 无设备服务注册，仅接受平台壳。 */
+    public static void setBluetoothServiceManager(BluetoothServiceManager manager) {}
+}
+@@ BluetoothProfile.java
+package android.bluetooth;
+/** 平台连接状态常量，不定义业务决策。 */
+public interface BluetoothProfile {
+    /** ACL/GATT 状态的公开值。 */
+    int STATE_DISCONNECTED = 0, STATE_CONNECTING = 1, STATE_CONNECTED = 2, STATE_DISCONNECTING = 3;
+}
+@@ BluetoothGattCallback.java
+package android.bluetooth;
+/** 回调由生产 LinkWatcher 覆盖。 */
+public abstract class BluetoothGattCallback {
+    /** 默认没有业务动作。 */
+    public void onConnectionStateChange(BluetoothGatt gatt, int status, int state) {}
+}
+@@ BluetoothAdapter.java
+package android.bluetooth;
+import android.content.AttributionSource;
+import java.util.LinkedHashSet;
+import java.util.Set;
+import android.bluetooth.le.BluetoothLeScanner;
+/** 系统状态与接口身份可控，业务缓存仍完全由真实类持有。 */
+public final class BluetoothAdapter {
+    /** 广播与状态保持 Android 公开值。 */
+    public static final String ACTION_STATE_CHANGED = "android.bluetooth.adapter.action.STATE_CHANGED";
+    /** 广播 extra 的真实名称。 */
+    public static final String EXTRA_STATE = "android.bluetooth.adapter.extra.STATE";
+    /** 状态序列供测试发出 12/13/10/11/12。 */
+    public static final int STATE_OFF = 10, STATE_TURNING_ON = 11, STATE_ON = 12, STATE_TURNING_OFF = 13;
+    /** 平台当前状态，服务切换不会直接改真实业务缓存。 */
+    public static volatile boolean enabled = true;
+    /** 配对设备，输入由测试独立指定。 */
+    public static final Set<BluetoothDevice> bonded = new LinkedHashSet<>();
+    /** 当前 GATT 服务身份，可为 null。 */
+    public static volatile IBluetoothGatt gattService = new IBluetoothGatt();
+    /** 保留真实 hidden 构造签名。 */
+    public BluetoothAdapter(IBluetoothManager manager, AttributionSource source) {}
+    /** 设备记录从受控平台列表读取。 */
+    public Set<BluetoothDevice> getBondedDevices() { return Set.copyOf(bonded); }
+    /** 仅返回当前接口，绝不补造观察器。 */
+    public IBluetoothGatt getBluetoothGatt() { return gattService; }
+    /** 返回平台开关状态。 */
+    public boolean isEnabled() { return enabled; }
+    /** 非测试路径仍保持最小 API 形状。 */
+    public BluetoothDevice getRemoteDevice(String mac) { return new BluetoothDevice(mac); }
+    /** 本测试不启动扫描。 */
+    public BluetoothLeScanner getBluetoothLeScanner() { return new BluetoothLeScanner(); }
+}
+@@ BluetoothGatt.java
+package android.bluetooth;
+import android.content.AttributionSource;
+import android.os.Handler;
+import java.util.ArrayList;
+import java.util.List;
+/** GATT 系统边界，记录真实业务发出的对象、附着参数和关闭次数。 */
+public final class BluetoothGatt {
+    /** 平台成功码。 */
+    public static final int GATT_SUCCESS = 0;
+    /** 构造出的所有对象，不能被 fixture 自动回收。 */
+    public static final List<BluetoothGatt> created = new ArrayList<>();
+    /** 下一次注册的返回值或异常输入。 */
+    public static boolean accept = true, throwOnRegister;
+    /** 创建时的系统服务身份。 */
+    public final IBluetoothGatt service;
+    /** 创建时的配对设备对象。 */
+    public final BluetoothDevice device;
+    /** 创建时的传输与 PHY 参数。 */
+    public final int transport, phy;
+    /** opportunistic 必须为真。 */
+    public final boolean opportunistic;
+    /** 实际注册次数与实际关闭次数。 */
+    public int registrations, closes;
+    /** 实际注册的 autoConnect 值。 */
+    public Boolean autoConnect;
+    /** 生产传入的回调。 */
+    public BluetoothGattCallback callback;
+    /** 生产传入的调度队列。 */
+    public Handler handler;
+    /** 保留真实 hidden constructor，null/dead 服务无法创建可用对象。 */
+    public BluetoothGatt(IBluetoothGatt service, BluetoothDevice device, int transport,
+                         boolean opportunistic, int phy, AttributionSource attribution) {
+        if (service == null || !service.isBinderAlive()) throw new IllegalStateException("GATT service unavailable");
+        this.service = service; this.device = device; this.transport = transport;
+        this.opportunistic = opportunistic; this.phy = phy;
+        created.add(this);
+    }
+    /** 模拟系统注册，记录参数，不替业务代码建立缓存。 */
+    public boolean connect(Boolean autoConnect, BluetoothGattCallback callback, Handler handler) {
+        this.autoConnect = autoConnect; this.callback = callback; this.handler = handler;
+        registrations++;
+        if (throwOnRegister) throw new IllegalStateException("registration failed");
+        return accept;
+    }
+    /** 所有主动连接路径立即失败。 */
+    public boolean connect() { throw io.github.yebei199.btrearm.PlatformViolations.forbidden("observer initiated connection"); }
+    /** 所有参数写入路径立即失败。 */
+    public boolean requestConnectionPriority(int priority) { throw io.github.yebei199.btrearm.PlatformViolations.forbidden("observer changed parameters"); }
+    /** 所有 PHY 写入路径立即失败。 */
+    public void setPreferredPhy(int tx, int rx, int options) { throw io.github.yebei199.btrearm.PlatformViolations.forbidden("observer changed PHY"); }
+    /** 仅记录实际关闭动作，不能删除业务条目。 */
+    public void close() { closes++; }
+    /** 交出真实配对记录对象。 */
+    public BluetoothDevice getDevice() { return device; }
+    /** 旧对象关闭后仍能产生迟到回调，按注册的 worker 排队。 */
+    public void emit(int reason, int state) throws Exception {
+        if (callback == null || handler == null) throw new AssertionError("no registered callback");
+        handler.post(() -> callback.onConnectionStateChange(this, reason, state));
+        handler.drain();
+    }
+}
+@@ BluetoothDevice.java
+package android.bluetooth;
+import android.content.Context;
+import android.os.ParcelUuid;
+/** 配对记录边界，主动请求永远是测试错误。 */
+public final class BluetoothDevice {
+    /** 平台公开常量。 */
+    public static final int TRANSPORT_LE = 2, PHY_LE_1M_MASK = 1;
+    /** 平台广播名称。 */
+    public static final String ACTION_ACL_CONNECTED = "android.bluetooth.device.action.ACL_CONNECTED";
+    /** 平台广播名称。 */
+    public static final String ACTION_ACL_DISCONNECTED = "android.bluetooth.device.action.ACL_DISCONNECTED";
+    /** 平台广播名称。 */
+    public static final String ACTION_UUID = "android.bluetooth.device.action.UUID";
+    /** 平台设备 extra。 */
+    public static final String EXTRA_DEVICE = "android.bluetooth.device.extra.DEVICE";
+    /** 配对记录的固定地址。 */
+    private final String address;
+    /** 不规范化地址，测试使用已知有效值。 */
+    public BluetoothDevice(String address) { this.address = address; }
+    /** 返回记录的地址。 */
+    public String getAddress() { return address; }
+    /** 输入设备比对需要名字。 */
+    public String getName() { return "test-controller"; }
+    /** 配对设备是 LE。 */
+    public int getType() { return 2; }
+    /** 此测试无 SDP 数据。 */
+    public ParcelUuid[] getUuids() { return null; }
+    /** 禁止系统主动连接。 */
+    public int connect() { throw io.github.yebei199.btrearm.PlatformViolations.forbidden("observer called device.connect"); }
+    /** 禁止 fallback 主动注册。 */
+    public BluetoothGatt connectGatt(Context context, boolean auto, BluetoothGattCallback callback, int transport) {
+        throw io.github.yebei199.btrearm.PlatformViolations.forbidden("observer called active connectGatt");
+    }
+    /** 禁止触发新 SDP。 */
+    public boolean fetchUuidsWithSdp() { throw io.github.yebei199.btrearm.PlatformViolations.forbidden("observer triggered SDP"); }
+}
+@@ BluetoothManager.java
+package android.bluetooth;
+/** 应用进程获取平台适配器的边界。 */
+public final class BluetoothManager {
+    /** 独立壳读取同一平台当前状态。 */
+    public BluetoothAdapter getAdapter() { return new BluetoothAdapter(null, null); }
+}
+@@ Context.java
+package android.content;
+import android.bluetooth.BluetoothManager;
+import java.util.ArrayList;
+import java.util.List;
+/** 只向生产实际注册过的广播接收器投递。 */
+public class Context {
+    /** 系统服务名称。 */
+    public static final String BLUETOOTH_SERVICE = "bluetooth", INPUT_SERVICE = "input";
+    /** 应用私有存储模式，仅参与完整类编译。 */
+    public static final int MODE_PRIVATE = 0;
+    /** 平台 receiver 注册记录。 */
+    private final List<BroadcastReceiver> receivers = new ArrayList<>();
+    /** 每次注册对应的过滤器。 */
+    private final List<IntentFilter> filters = new ArrayList<>();
+    /** 本场景无需切换 application context。 */
+    public Context getApplicationContext() { return this; }
+    /** 观察器只需要蓝牙 manager。 */
+    public Object getSystemService(String name) { return name.equals(BLUETOOTH_SERVICE) ? new BluetoothManager() : null; }
+    /** 通知路径不进入本测试。 */
+    public <T> T getSystemService(Class<T> type) { return null; }
+    /** 记录真实订阅，不自动增加状态 action。 */
+    public Intent registerReceiver(BroadcastReceiver receiver, IntentFilter filter) {
+        receivers.add(receiver); filters.add(filter); return null;
+    }
+    /** 实际按 filter 分发，缺失订阅会暴露在业务断言中。 */
+    public void broadcast(Intent intent) {
+        for (int i = 0; i < receivers.size(); i++) {
+            if (filters.get(i).actions.contains(intent.getAction())) receivers.get(i).onReceive(this, intent);
+        }
+    }
+    /** 存储路径不进入本测试。 */
+    public SharedPreferences getSharedPreferences(String name, int mode) { return null; }
+}
+@@ BroadcastReceiver.java
+package android.content;
+/** 业务 receiver 保持真实实现。 */
+public abstract class BroadcastReceiver {
+    /** 平台投递入口。 */
+    public abstract void onReceive(Context context, Intent intent);
+}
+@@ IntentFilter.java
+package android.content;
+import java.util.HashSet;
+import java.util.Set;
+/** 只匹配生产添加的 action。 */
+public final class IntentFilter {
+    /** 已订阅 action。 */
+    public final Set<String> actions = new HashSet<>();
+    /** 保留公开注册入口。 */
+    public void addAction(String action) { actions.add(action); }
+}
+@@ Intent.java
+package android.content;
+import java.util.HashMap;
+import java.util.Map;
+/** 只保存测试注入的广播负载。 */
+public final class Intent {
+    /** 通知代码编译需要的平台标志。 */
+    public static final int FLAG_ACTIVITY_NEW_TASK = 0x10000000;
+    /** 当前 action。 */
+    private String action;
+    /** 原样的 extra 值。 */
+    private final Map<String, Object> extras = new HashMap<>();
+    /** 按 action 创建广播。 */
+    public Intent(String action) { this.action = action; }
+    /** 通知路径不运行。 */
+    public Intent(Context context, Class<?> type) {}
+    /** 原样返回 action。 */
+    public String getAction() { return action; }
+    /** 保留 extra 类型和值。 */
+    public Intent putExtra(String name, Object value) { extras.put(name, value); return this; }
+    /** 使用生产调用指定的类型。 */
+    public <T> T getParcelableExtra(String name, Class<T> type) { return type.cast(extras.get(name)); }
+    /** 状态未提供时返回平台 default。 */
+    public int getIntExtra(String name, int fallback) { return (int) extras.getOrDefault(name, fallback); }
+    /** 通知路径不运行。 */
+    public Intent addFlags(int flags) { return this; }
+}
+@@ ComponentName.java
+package android.content;
+/** Shizuku 绑定参数的边界类型。 */
+public final class ComponentName {
+    /** 不需要 Android 包管理器。 */
+    public ComponentName(Context context, String name) {}
+}
+@@ ServiceConnection.java
+package android.content;
+import android.os.IBinder;
+/** 业务 ServiceConnection 原样接收连接和死亡事件。 */
+public interface ServiceConnection {
+    /** 当前用户服务绑定成功。 */
+    void onServiceConnected(ComponentName name, IBinder binder);
+    /** 当前用户服务失效。 */
+    void onServiceDisconnected(ComponentName name);
+}
+@@ PackageManager.java
+package android.content.pm;
+/** 已授权是测试前提，授权 UI 不进入本测试。 */
+public final class PackageManager {
+    /** Android 公开成功值。 */
+    public static final int PERMISSION_GRANTED = 0;
+}
+@@ IPrivilegedConnect.java
+package io.github.yebei199.btrearm;
+import android.os.IBinder;
+/** 仅替代生成 AIDL 的传输壳，方法在真实服务实现中执行。 */
+public interface IPrivilegedConnect {
+    /** 真实服务公开入口。 */
+    String connect(String mac) throws Exception;
+    /** 真实服务公开入口。 */
+    String watchLink(String mac) throws Exception;
+    /** 真实服务公开入口。 */
+    int lastDisconnectReason(String mac) throws Exception;
+    /** 真实服务公开入口。 */
+    void destroy() throws Exception;
+    /** 与 Android 生成的 Stub 保持形状。 */
+    abstract class Stub implements IPrivilegedConnect, IBinder {
+        /** 只把 binder 壳转回当前接口，不改结果。 */
+        public static IPrivilegedConnect asInterface(IBinder binder) { return (IPrivilegedConnect) binder; }
+        /** 当前传输身份。 */
+        public IBinder asBinder() { return this; }
+    }
+}
+@@ Shizuku.java
+package rikka.shizuku;
+import android.content.ComponentName;
+import android.content.ServiceConnection;
+import android.os.IBinder;
+/** 只驱动真实绑定回调，不参与 tuned 等业务缓存。 */
+public final class Shizuku {
+    /** 测试提供的用户服务身份。 */
+    public static IBinder service;
+    /** 业务注册的绑定回调。 */
+    private static ServiceConnection connection;
+    /** 业务注册的死亡回调。 */
+    private static Runnable death;
+    /** 业务注册的 ready 回调。 */
+    private static Runnable ready;
+    /** 版本输入可供下一阶段审查。 */
+    public static int boundVersion;
+    /** Shizuku 可用且已授权是这里的前提。 */
+    public static boolean isPreV11() { return false; }
+    /** 权限处理不在本轮。 */
+    public static int checkSelfPermission() { return 0; }
+    /** 绑定器活着时接口可用。 */
+    public static boolean pingBinder() { return service != null; }
+    /** sticky 语义驱动真实 init 到 bind。 */
+    public static void addBinderReceivedListenerSticky(Runnable callback) { ready = callback; callback.run(); }
+    /** 记录真实死亡处理。 */
+    public static void addBinderDeadListener(Runnable callback) { death = callback; }
+    /** 权限回调形状。 */
+    public interface PermissionListener { void onRequestPermissionResult(int code, int result); }
+    /** 已授权场景不会调用权限回调。 */
+    public static void addRequestPermissionResultListener(PermissionListener callback) {}
+    /** 不弹任何权限窗口。 */
+    public static void requestPermission(int code) { throw new AssertionError("unexpected permission request"); }
+    /** 保留用户服务参数链的形状。 */
+    public static final class UserServiceArgs {
+        /** 保存真实生产传入版本。 */
+        int version;
+        /** 接受真实 component 参数。 */
+        public UserServiceArgs(ComponentName component) {}
+        /** 保留进程名配置。 */
+        public UserServiceArgs processNameSuffix(String suffix) { return this; }
+        /** 记录配置的版本。 */
+        public UserServiceArgs version(int version) { this.version = version; return this; }
+        /** 保留守护配置。 */
+        public UserServiceArgs daemon(boolean daemon) { return this; }
+    }
+    /** 绑定真实服务，通过业务回调完成连接。 */
+    public static void bindUserService(UserServiceArgs args, ServiceConnection callback) {
+        boundVersion = args.version; connection = callback; callback.onServiceConnected(null, service);
+    }
+    /** 模拟服务断开和新实例绑定，无业务缓存操作。 */
+    public static void replace(IBinder replacement) {
+        connection.onServiceDisconnected(null); service = replacement; ready.run();
+    }
+    /** 模拟无 disconnected 回调的 binder 死亡和重新到位。 */
+    public static void dieAndRestore(IBinder replacement) {
+        death.run(); service = replacement; ready.run();
+    }
+}
+@@ Diagnostics.java
+package io.github.yebei199.btrearm.diagnostics;
+import android.content.Context;
+/** 持久采集不进入观察器测试，已有采集测试独立负责。 */
+public final class Diagnostics {
+    /** 不起后台采集或打开文件。 */
+    public static void start(Context context) {}
+    /** 此边界不决定任何被测结果。 */
+    public static void record(String kind, String text) {}
+}
+@@ Log.java
+package android.util;
+/** 日志输出边界，避免状态日志驱动测试。 */
+public final class Log {
+    /** 保留原始日志作为失败上下文。 */
+    public static int i(String tag, String message) { System.out.println(tag + ": " + message); return 0; }
+}
+@@ ParcelUuid.java
+package android.os;
+import java.util.UUID;
+/** 仅为未执行路径提供公开形状。 */
+public final class ParcelUuid {
+    /** 原始 UUID。 */
+    private final UUID uuid;
+    /** 原样保存。 */
+    public ParcelUuid(UUID uuid) { this.uuid = uuid; }
+    /** 原样返回。 */
+    public UUID getUuid() { return uuid; }
+}
+@@ SharedPreferences.java
+package android.content;
+import java.util.Set;
+/** 存盘路径不执行。 */
+public interface SharedPreferences {
+    /** 未进入的读取入口。 */
+    Set<String> getStringSet(String key, Set<String> fallback);
+    /** 未进入的写入入口。 */
+    Editor edit();
+    /** 存盘 API 形状。 */
+    interface Editor {
+        /** 未进入的写入入口。 */
+        Editor putStringSet(String key, Set<String> value);
+        /** 未进入的提交入口。 */
+        void apply();
+    }
+}
+@@ InputManager.java
+package android.hardware.input;
+import android.view.InputDevice;
+/** 输入设备检测不在 Java 观察器边界内。 */
+public final class InputManager {
+    /** 未注入任何输入设备。 */
+    public int[] getInputDeviceIds() { return new int[0]; }
+    /** 未注入任何输入设备。 */
+    public InputDevice getInputDevice(int id) { return null; }
+}
+@@ InputDevice.java
+package android.view;
+/** 输入设备路径只参与编译。 */
+public final class InputDevice {
+    /** 本轮不模拟输入恢复。 */
+    public String getName() { return ""; }
+}
+@@ BluetoothLeScanner.java
+package android.bluetooth.le;
+import java.util.List;
+/** 观察器不得发起扫描。 */
+public final class BluetoothLeScanner {
+    /** 扫描启动即越过观察器范围。 */
+    public void startScan(List<ScanFilter> filters, ScanSettings settings, ScanCallback callback) {
+        throw io.github.yebei199.btrearm.PlatformViolations.forbidden("observer started scan");
+    }
+    /** 扫描停止即越过观察器范围。 */
+    public void stopScan(ScanCallback callback) { throw io.github.yebei199.btrearm.PlatformViolations.forbidden("observer stopped scan"); }
+}
+@@ ScanCallback.java
+package android.bluetooth.le;
+/** 真实 Rearm 的未执行扫描回调需要的平台形状。 */
+public abstract class ScanCallback {
+    /** 默认无动作。 */
+    public void onScanResult(int type, ScanResult result) {}
+    /** 默认无动作。 */
+    public void onScanFailed(int code) {}
+}
+@@ ScanResult.java
+package android.bluetooth.le;
+import android.bluetooth.BluetoothDevice;
+/** 扫描不进入测试。 */
+public final class ScanResult {
+    /** 不提供模拟设备。 */
+    public BluetoothDevice getDevice() { return null; }
+}
+@@ ScanFilter.java
+package android.bluetooth.le;
+import android.os.ParcelUuid;
+/** 仅供未运行扫描代码编译。 */
+public final class ScanFilter {
+    /** 公开 builder 形状。 */
+    public static final class Builder {
+        /** 原样接受扫描配置。 */
+        public Builder setDeviceAddress(String mac) { return this; }
+        /** 原样接受扫描配置。 */
+        public Builder setServiceUuid(ParcelUuid uuid) { return this; }
+        /** 返回编译壳。 */
+        public ScanFilter build() { return new ScanFilter(); }
+    }
+}
+@@ ScanSettings.java
+package android.bluetooth.le;
+/** 仅供未运行扫描代码编译。 */
+public final class ScanSettings {
+    /** Android 公开扫描模式。 */
+    public static final int SCAN_MODE_LOW_LATENCY = 2, SCAN_MODE_LOW_POWER = 0;
+    /** 公开 builder 形状。 */
+    public static final class Builder {
+        /** 原样接受扫描配置。 */
+        public Builder setScanMode(int mode) { return this; }
+        /** 返回编译壳。 */
+        public ScanSettings build() { return new ScanSettings(); }
+    }
+}
+@@ MainActivity.java
+package io.github.yebei199.btrearm;
+/** 仅为通知代码编译提供类型，UI 不进入测试。 */
+public final class MainActivity {}
+@@ Notification.java
+package android.app;
+/** 通知路径不执行。 */
+public final class Notification {
+    /** builder 仅供完整 Rearm 编译。 */
+    public static final class Builder {
+        /** 接受平台 context 和 channel。 */
+        public Builder(android.content.Context context, String channel) {}
+        /** 接受平台图标。 */
+        public Builder setSmallIcon(int icon) { return this; }
+        /** 接受平台标题。 */
+        public Builder setContentTitle(String title) { return this; }
+        /** 接受平台内容。 */
+        public Builder setContentText(String text) { return this; }
+        /** 接受平台样式。 */
+        public Builder setStyle(BigTextStyle style) { return this; }
+        /** 接受平台 intent。 */
+        public Builder setContentIntent(PendingIntent intent) { return this; }
+        /** 接受平台关闭配置。 */
+        public Builder setAutoCancel(boolean cancel) { return this; }
+        /** 交出编译壳。 */
+        public Notification build() { return new Notification(); }
+    }
+    /** 公开样式形状。 */
+    public static final class BigTextStyle {
+        /** 接受平台内容。 */
+        public BigTextStyle bigText(String text) { return this; }
+    }
+}
+@@ NotificationChannel.java
+package android.app;
+/** 通知路径不执行。 */
+public final class NotificationChannel {
+    /** 公开构造形状。 */
+    public NotificationChannel(String id, String name, int importance) {}
+}
+@@ NotificationManager.java
+package android.app;
+/** 通知路径不执行。 */
+public final class NotificationManager {
+    /** Android 公开优先级。 */
+    public static final int IMPORTANCE_HIGH = 4;
+    /** 未执行平台入口。 */
+    public void cancel(int id) {}
+    /** 未执行平台入口。 */
+    public void createNotificationChannel(NotificationChannel channel) {}
+    /** 未执行平台入口。 */
+    public void notify(int id, Notification notification) {}
+}
+@@ PendingIntent.java
+package android.app;
+import android.content.Context;
+import android.content.Intent;
+/** 通知路径不执行。 */
+public final class PendingIntent {
+    /** Android 公开标志。 */
+    public static final int FLAG_IMMUTABLE = 0x04000000;
+    /** 公开入口形状。 */
+    public static PendingIntent getActivity(Context context, int code, Intent intent, int flags) { return new PendingIntent(); }
+}
+@@ R.java
+package android;
+/** 图标类型仅参与通知代码编译。 */
+public final class R {
+    /** 平台资源命名空间。 */
+    public static final class drawable {
+        /** 图标内容不影响被测行为。 */
+        public static final int stat_sys_data_bluetooth = 1;
+    }
+}
+
+@@ PlatformViolations.java
+package io.github.yebei199.btrearm;
+import java.util.ArrayList;
+import java.util.List;
+/** 即使生产catch(Throwable)吞下异常，也不能吞掉观察器越界的记录。 */
+public final class PlatformViolations {
+    /** 当前独立JVM内的越界动作。 */
+    public static final List<String> attempts = new ArrayList<>();
+    /** 同时记录和拒绝动作，结果仍由真实业务调用决定。 */
+    public static AssertionError forbidden(String action) { attempts.add(action); return new AssertionError(action); }
+}

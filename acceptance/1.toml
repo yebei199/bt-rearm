@@ -1,0 +1,77 @@
+# 当前唯一合同为D-OBS，AC-1/2/3总目标由主路由持有。
+[[ac]]
+id = "AC-4"
+kind = "new"
+entry = "Rearm.attach + Privileged.init；状态广播12/13/10/11/12后调用既有巡检Java终点Rearm.watchLink；直接PrivilegedConnect.watchLink"
+observe = "真实生产发出的GATT构造/注册/close：旧对象失效关闭，新对象属于新服务，重复巡检只注册一次；关闭/无服务/拒绝/异常不会缓存假成功"
+tests = [
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testServiceRestartReattachesOnce",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testDeadServiceHandleIsNotAlreadyWatching",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testServiceReplacementWithoutAclReattaches",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testDisabledAdapterDefersAttachment",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testUnavailableServiceRetriesAfterRecovery",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testRejectedRegistrationReleasesAndRetries",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testRegistrationExceptionReleasesAndRetries",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testShizukuReplacementClearsAppCache",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testShizukuDeathClearsAppCache",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testInFlightSuccessCannotRestoreInvalidatedCache",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testInFlightReplyFromReplacedShizukuIsIgnored",
+]
+doubles = [
+  "Android Context/filter/state/Binder/GATT：仅注入平台信号和记录真实对象操作，不清理业务缓存；不证明OEM注册和系统广播时序",
+  "Handler：独立串行worker及队列屏障，延时不自动推进；不证明Android消息循环调度",
+  "Shizuku/AIDL：驱动真实Privileged回调和PrivilegedConnect方法，只包装传输；不证明跨进程Binder分发",
+  "JNI记录器/Diagnostics替身：仅记真实Java出口；不执行Rust巡检定时器、持久采集或真机输入恢复",
+]
+mutation = "保留gatts或tuned任一旧缓存、允许失效后在途旧成功再次tuned.add，会使新服务身份或实际新注册数断言失败；不允许编译失败充当RED"
+
+[[ac]]
+id = "AC-5"
+kind = "new"
+entry = "真实注册LinkWatcher收到旧/新对象的CONNECTED和DISCONNECTED；真实ACL receiver与PrivilegedConnect.lastDisconnectReason两种事件顺序"
+observe = "旧对象不会close或删除新观察器，不发布新世代原因；当前原因一次消费；新连接不读上一连接原因；ACL先到输出unknown且不留下迟到原因"
+tests = [
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testOldDisconnectCannotRemoveNewObserver",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testOldConnectedCannotReviveOldObserver",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testRejectedObserverCannotPublishReason",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testCurrentReasonConsumedOnce",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testNewConnectionDropsUnconsumedReason",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testAclBeforeCallbackKeepsUnknownAndDropsLateReason",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testLateReasonAfterReattachIsIgnored",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testServiceRestartDiscardsOldReason",
+]
+doubles = ["Android GATT/Handler边界只投递真实注册回调，不重写gatts/lastReason；JNI只记录真实ACL出口；不能证明系统真实事件到达先后"]
+mutation = "恢复按MAC无条件remove/写lastReason，使旧回调伤害新对象或原因断言失败；不清新连接原因槽，使旧19被下一连接消费"
+
+[[ac]]
+id = "AC-5"
+kind = "regression"
+entry = "Rearm.watchLink与真实ACL receiver消费当前0x08、0x13、unknown；多设备公开服务入口"
+observe = "JNI实际分别输出disconnected、peer-left、disconnected；原因和观察器保持按设备隔离；未配对地址不附着，健康巡检不重复注册"
+tests = [
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testRemoteTerminatedKeepsPeerLeftPolicy",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testTimeoutKeepsDisconnectPolicy",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testUnknownKeepsDisconnectPolicy",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testReasonsAndObserversStayPerDevice",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testUnbondedAddressDoesNotAttach",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testRepeatedPatrolKeepsPassiveObserver",
+]
+doubles = ["JNI以测试动态库记录真实Java出口；不执行Rust重连/退避/超时决策；GATT替身只记录实际注册和回收"]
+mutation = "把19路由到普通断开、把unknown猜成peer-left、消费另一MAC原因、改为主动连接或移除去重，导致出口/对象/隔离断言失败"
+
+[[ac]]
+id = "AC-6"
+kind = "regression"
+entry = "真实PrivilegedConnect反射构造/注册GATT，真实Rearm巡检Java终点"
+observe = "实际使用配对记录对象、opportunistic=true、autoConnect=false、LE/1M参数；主动连接、SDP、扫描和参数写入会使测试失败"
+tests = [
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testRepeatedPatrolKeepsPassiveObserver",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testServiceRestartReattachesOnce",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testServiceReplacementWithoutAclReattaches",
+]
+doubles = ["GATT/Device/Scanner系统边界记录真实调用或拒绝越界动作；不证明真实平台恢复、APK构建或自然断联根治"]
+mutation = "关闭opportunistic或启用autoConnect/主动connectGatt/参数写入，导致实际注册参数或边界违规断言失败"
+
+[[ac]]
+id = "AC-6"
+none = "测试设计审核/proceed、RED/GREEN证据、必要APK构建、targeted干净快照凭据及无设备操作是交付流程，必须由主路由核对原始证据；本测试骨架尚不宣称已满足"
