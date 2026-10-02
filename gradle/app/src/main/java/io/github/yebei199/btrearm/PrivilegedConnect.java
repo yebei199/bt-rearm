@@ -9,6 +9,7 @@ import android.content.AttributionSource;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.IInterface;
 import android.os.Process;
 
 import java.lang.reflect.Constructor;
@@ -18,6 +19,7 @@ import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 跑在 shell 身份下的连接服务,由 Shizuku 拉起。
@@ -47,10 +49,21 @@ public final class PrivilegedConnect extends IPrivilegedConnect.Stub {
     private final Handler worker;
     private BluetoothAdapter adapter;
     private AttributionSource source;
+    /** 只保护观察身份与原因，不在此锁内调用平台或等待worker。 */
+    private final Object observerLock = new Object();
+    /** 在途注册捕获的连接身份，ACL退休后不得重新提交。 */
+    private final Map<String, Object> connections = new HashMap<>();
+    /** 系统服务失效的世代，防止锁外查询跨过失效后重新提交。 */
+    private long serviceGeneration;
     /** 挂在各设备链路上的观察客户端,断开即关掉释放。 */
     private final Map<String, BluetoothGatt> gatts = new HashMap<>();
-    /** 各设备上一次断开的 HCI 原因码,取走即清。 */
+    /** 当前服务的断开状态，与连接退休在短状态临界区内原子消费。 */
     private final Map<String, Integer> lastReason = new HashMap<>();
+
+    /** 当前系统GATT服务的身份，失效后不能再信任任何旧观察器。 */
+    private IBinder gattBinder;
+    /** 与当前服务绑定的死亡监听，换代时解除。 */
+    private IBinder.DeathRecipient gattDeath;
 
     public PrivilegedConnect() {
         HandlerThread thread = new HandlerThread("rearm-privileged");
@@ -105,12 +118,137 @@ public final class PrivilegedConnect extends IPrivilegedConnect.Stub {
         }
     }
 
+    /** 读取并消费原因不会改变仍健康的观察器。 */
     @Override
     public int lastDisconnectReason(String mac) {
-        synchronized (lastReason) {
-            Integer reason = lastReason.remove(mac);
-            return reason == null ? -1 : reason;
+        return consumeReason(mac, false);
+    }
+
+    /** ACL消费与身份退休立即完成，不等待平台注册或关闭。 */
+    @Override
+    public int retireConnection(String mac) {
+        return consumeReason(mac, true);
+    }
+
+    /** 只访问短状态临界区，资源回收在返回路径之外。 */
+    private int consumeReason(String mac, boolean retire) {
+        IBinder binder;
+        synchronized (observerLock) { binder = gattBinder; }
+        if (binder != null && !binder.isBinderAlive()) invalidateService(binder);
+        BluetoothGatt old = null;
+        Integer reason;
+        synchronized (observerLock) {
+            reason = lastReason.remove(mac);
+            if (retire) {
+                connections.remove(mac);
+                old = gatts.remove(mac);
+            }
         }
+        BluetoothGatt retired = old;
+        if (retired != null) worker.post(() -> closeObserver(retired));
+        return reason == null ? -1 : reason;
+    }
+
+    /** 适配器失效先清观察身份，平台回收不阻挡广播。 */
+    @Override
+    public void invalidateObservers() {
+        invalidateService(null);
+    }
+
+    /** 已失效状态的资源快照，只在锁外回收。 */
+    private record RetiredObservers(BluetoothGatt[] gatts, IBinder binder, IBinder.DeathRecipient death) {}
+
+    /** 调用者持锁：清账先于close，阻塞中的旧注册也失去身份。 */
+    private RetiredObservers retireAllLocked() {
+        RetiredObservers old = new RetiredObservers(gatts.values().toArray(new BluetoothGatt[0]),
+                gattBinder, gattDeath);
+        gatts.clear();
+        lastReason.clear();
+        connections.clear();
+        serviceGeneration++;
+        gattBinder = null;
+        gattDeath = null;
+        return old;
+    }
+
+    /** 旧死亡通知只能失效仍匹配的服务，清理交给worker。 */
+    private void invalidateService(IBinder expected) {
+        RetiredObservers old;
+        synchronized (observerLock) {
+            if (expected != null && expected != gattBinder) return;
+            old = retireAllLocked();
+        }
+        worker.post(() -> releaseRetired(old));
+    }
+
+    /** 平台操作始终在短状态临界区之外，允许消费已记录原因。 */
+    private static void releaseRetired(RetiredObservers old) {
+        unlinkDeath(old.binder(), old.death());
+        for (BluetoothGatt gatt : old.gatts()) closeObserver(gatt);
+    }
+
+    /** 已死或已解除的监听不影响观察身份失效。 */
+    private static void unlinkDeath(IBinder binder, IBinder.DeathRecipient death) {
+        if (binder == null || death == null) return;
+        try {
+            binder.unlinkToDeath(death, 0);
+        } catch (RuntimeException ignored) {
+            // 资源已失效，不重新取得任何状态所有权。
+        }
+    }
+
+    /** 回收只触碰传入的对象，异常不阻止后续巡检。 */
+    private static void closeObserver(BluetoothGatt gatt) {
+        if (gatt == null) return;
+        try {
+            gatt.close();
+        } catch (RuntimeException ignored) {
+            // 系统服务可能已死，缓存已清所以仍可恢复。
+        }
+    }
+
+    /** 锁外查询和登记平台身份，提交时核对查询期间没有发生失效。 */
+    private Object currentGattService() throws Exception {
+        long generation;
+        synchronized (observerLock) { generation = serviceGeneration; }
+        if (!adapter.isEnabled()) {
+            invalidateObservers();
+            throw new IllegalStateException("蓝牙已关闭");
+        }
+        Object iGatt = BluetoothAdapter.class.getMethod("getBluetoothGatt").invoke(adapter);
+        IBinder binder = iGatt == null ? null : ((IInterface) iGatt).asBinder();
+        if (binder == null || !binder.isBinderAlive()) {
+            invalidateObservers();
+            throw new IllegalStateException("GATT服务不可用");
+        }
+        RetiredObservers old;
+        synchronized (observerLock) {
+            if (generation != serviceGeneration) throw new IllegalStateException("观察服务已失效");
+            if (binder == gattBinder) return iGatt;
+            old = retireAllLocked();
+            generation = serviceGeneration;
+        }
+        releaseRetired(old);
+        AtomicBoolean died = new AtomicBoolean();
+        IBinder.DeathRecipient death = () -> {
+            died.set(true);
+            invalidateService(binder);
+        };
+        binder.linkToDeath(death, 0);
+        boolean alive = binder.isBinderAlive();
+        boolean accepted;
+        synchronized (observerLock) {
+            accepted = generation == serviceGeneration && alive && !died.get();
+            if (accepted) {
+                gattBinder = binder;
+                gattDeath = death;
+            }
+        }
+        if (!accepted) {
+            unlinkDeath(binder, death);
+            throw new IllegalStateException("观察服务已失效");
+        }
+        return iGatt;
     }
 
     /**
@@ -125,34 +263,58 @@ public final class PrivilegedConnect extends IPrivilegedConnect.Stub {
      * 是 public,而手柄用随机静态地址,类型不符的连接请求发给的是一个不存在的设备。
      */
     private String watchOnWorker(String mac) {
+        BluetoothGatt pending = null;
+        Object connection = null;
+        boolean registered = false;
         try {
-            if (adapter == null) {
-                adapter = buildAdapter();
+            if (adapter == null) adapter = buildAdapter();
+            Object iGatt = currentGattService();
+            IBinder binder = ((IInterface) iGatt).asBinder();
+            synchronized (observerLock) {
+                if (gattBinder != binder) return "观察服务已失效 " + mac;
+                if (gatts.containsKey(mac)) return "链路观察客户端已挂着 " + mac;
             }
-            if (gatts.containsKey(mac)) return "链路观察客户端已挂着 " + mac;
             BluetoothDevice device = null;
             for (BluetoothDevice d : adapter.getBondedDevices()) {
                 if (d.getAddress().equals(mac)) device = d;
             }
             if (device == null) return mac + " 不在已配对列表里,挂不上客户端";
-            Object iGatt = BluetoothAdapter.class.getMethod("getBluetoothGatt").invoke(adapter);
+            synchronized (observerLock) {
+                if (gattBinder != binder) return "观察服务已失效 " + mac;
+                connection = new Object();
+                connections.put(mac, connection);
+                lastReason.remove(mac);
+            }
             Constructor<BluetoothGatt> ctor = BluetoothGatt.class.getDeclaredConstructor(
                     Class.forName("android.bluetooth.IBluetoothGatt"),
                     BluetoothDevice.class, int.class, boolean.class, int.class,
                     AttributionSource.class);
             ctor.setAccessible(true);
-            BluetoothGatt gatt = ctor.newInstance(
-                    iGatt, device, TRANSPORT_LE, true, PHY_1M_MASK, source);
+            pending = ctor.newInstance(iGatt, device, TRANSPORT_LE, true, PHY_1M_MASK, source);
             Method connect = BluetoothGatt.class.getDeclaredMethod(
                     "connect", Boolean.class, BluetoothGattCallback.class, Handler.class);
             connect.setAccessible(true);
-            Object ok = connect.invoke(gatt, Boolean.FALSE, new LinkWatcher(mac), worker);
+            Object ok = connect.invoke(pending, Boolean.FALSE, new LinkWatcher(mac), worker);
             if (!Boolean.TRUE.equals(ok)) return "挂链路观察客户端被拒 " + mac;
-            gatts.put(mac, gatt);
+            synchronized (observerLock) {
+                if (connections.get(mac) != connection || gattBinder != binder) {
+                    return "链路观察注册已退休 " + mac;
+                }
+                gatts.put(mac, pending);
+                registered = true;
+                pending = null;
+            }
             return "已挂链路观察客户端 " + mac;
         } catch (Throwable t) {
             Throwable cause = t.getCause() == null ? t : t.getCause();
             return "挂链路观察客户端失败 " + mac + ": " + cause;
+        } finally {
+            if (!registered && connection != null) {
+                synchronized (observerLock) {
+                    if (connections.get(mac) == connection) connections.remove(mac);
+                }
+            }
+            closeObserver(pending);
         }
     }
 
@@ -170,23 +332,32 @@ public final class PrivilegedConnect extends IPrivilegedConnect.Stub {
             this.mac = mac;
         }
 
+        /** 回调先在短状态区确认所有权并记原因，再到锁外关闭对象。 */
         @Override
         public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
+            IBinder binder;
+            synchronized (observerLock) {
+                if (gatts.get(mac) != g) return;
+                binder = gattBinder;
+            }
+            if (binder == null || !binder.isBinderAlive()) {
+                invalidateService(binder);
+                return;
+            }
+            synchronized (observerLock) {
+                if (gatts.get(mac) != g || gattBinder != binder) return;
+                if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    lastReason.put(mac, status);
+                    gatts.remove(mac);
+                }
+            }
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 android.util.Log.i("btrearm", "链路观察客户端已附着 " + mac + " 状态 " + status);
                 return;
             }
+            if (newState != BluetoothProfile.STATE_DISCONNECTED) return;
             android.util.Log.i("btrearm", "链路观察客户端断开 " + mac + " 状态 " + status);
-            synchronized (lastReason) {
-                lastReason.put(mac, status);
-            }
-            if (gatts.remove(mac) != null) {
-                try {
-                    g.close();
-                } catch (SecurityException e) {
-                    // 关不掉也不影响下一次重挂。
-                }
-            }
+            closeObserver(g);
         }
     }
 

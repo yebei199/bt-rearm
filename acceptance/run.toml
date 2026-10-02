@@ -1,0 +1,3 @@
+# 运行预算由环境提供，JUnit与报告同在本任务文书目录。
+command = ["bash", "tools/observer/test.sh"]
+junit = [".dispatch/1-observer-junit.xml"]
