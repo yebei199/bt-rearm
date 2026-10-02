@@ -3,7 +3,7 @@
 id = "AC-4"
 kind = "new"
 entry = "Rearm.attach + Privileged.init；状态广播12/13/10/11/12后调用既有巡检Java终点Rearm.watchLink；直接PrivilegedConnect.watchLink"
-observe = "真实生产发出的GATT构造/注册/close：旧对象失效关闭，新对象属于新服务，重复巡检只注册一次；关闭/无服务/拒绝/异常不会缓存假成功"
+observe = "真实生产发出的GATT构造/注册/close：旧对象失效关闭，新对象属于新服务，重复巡检只注册一次；关闭/无服务/同步拒绝/异常/请求受理后的异步注册失败不会缓存假成功；异步失败无ACL时下一巡检仍实际重挂，健康后不重复注册"
 tests = [
   "io.github.yebei199.btrearm.ObserverLifecycleTest::testServiceRestartReattachesOnce",
   "io.github.yebei199.btrearm.ObserverLifecycleTest::testDeadServiceHandleIsNotAlreadyWatching",
@@ -12,6 +12,7 @@ tests = [
   "io.github.yebei199.btrearm.ObserverLifecycleTest::testUnavailableServiceRetriesAfterRecovery",
   "io.github.yebei199.btrearm.ObserverLifecycleTest::testRejectedRegistrationReleasesAndRetries",
   "io.github.yebei199.btrearm.ObserverLifecycleTest::testRegistrationExceptionReleasesAndRetries",
+  "io.github.yebei199.btrearm.ObserverLifecycleTest::testAsyncRegistrationFailureRetriesWithoutAcl",
   "io.github.yebei199.btrearm.ObserverLifecycleTest::testShizukuReplacementClearsAppCache",
   "io.github.yebei199.btrearm.ObserverLifecycleTest::testShizukuDeathClearsAppCache",
   "io.github.yebei199.btrearm.ObserverLifecycleTest::testInFlightSuccessCannotRestoreInvalidatedCache",
@@ -23,7 +24,7 @@ doubles = [
   "Shizuku/AIDL：驱动真实Privileged回调和PrivilegedConnect方法，只包装传输；不证明跨进程Binder分发",
   "JNI记录器/Diagnostics替身：仅记真实Java出口；不执行Rust巡检定时器、持久采集或真机输入恢复",
 ]
-mutation = "保留gatts或tuned任一旧缓存、允许失效后在途旧成功再次tuned.add，会使新服务身份或实际新注册数断言失败；不允许编译失败充当RED"
+mutation = "保留gatts或tuned任一旧缓存、允许失效后在途旧成功再次tuned.add，会使新服务身份或实际新注册数断言失败；仅删除gatts却保留tuned时，133异步注册失败后下一巡检的新建数断言失败；133是平台注册/建链失败状态，不是手柄HCI断联原因；不允许编译失败充当RED"
 
 [[ac]]
 id = "AC-5"

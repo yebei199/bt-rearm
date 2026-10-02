@@ -181,6 +181,28 @@ public final class ObserverLifecycleTest {
         requirePassive(current);
     }
 
+    /** 133是平台注册/建链失败状态；无CONNECTED或ACL时，巡检仍须重挂只读观察器。 */
+    public static void testAsyncRegistrationFailureRetriesWithoutAcl() throws Exception {
+        setup();
+        BluetoothGatt failed = watch();
+        requirePassive(failed);
+        // 只注入系统注册失败回调，不把133当作手柄HCI原因，也不清理业务缓存。
+        failed.emit(133, BluetoothProfile.STATE_DISCONNECTED);
+        require(failed.closes == 1, "asynchronously failed observer was not released");
+        BluetoothGatt current = watch();
+        require(BluetoothGatt.created.size() == 2 && current != failed,
+                "async registration failure without ACL suppressed next patrol");
+        require(current.service == BluetoothAdapter.gattService && current.closes == 0,
+                "retry did not attach to the current service");
+        requirePassive(current);
+        current.emit(0, BluetoothProfile.STATE_CONNECTED);
+        Rearm.watchLink(MAC);
+        Rearm.watchLink(MAC);
+        require(BluetoothGatt.created.size() == 2 && current.closes == 0,
+                "healthy retry was closed or duplicated by repeated patrol");
+        requirePassive(current);
+    }
+
     /** 注册异常与被拒具有相同回收/重试语义。 */
     public static void testRegistrationExceptionReleasesAndRetries() {
         setup();
