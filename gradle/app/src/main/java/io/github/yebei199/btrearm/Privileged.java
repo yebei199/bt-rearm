@@ -22,7 +22,7 @@ import rikka.shizuku.Shizuku;
 final class Privileged {
 
     /** 用户服务版本号,改了服务实现要加一,否则 Shizuku 会复用旧进程。 */
-    private static final int SERVICE_VERSION = 4;
+    private static final int SERVICE_VERSION = 5;
 
     private static final int PERMISSION_REQUEST_CODE = 2;
 
